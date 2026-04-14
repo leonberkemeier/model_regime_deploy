@@ -1,4 +1,8 @@
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Assuming you will set these in a local .env later on the AI pc
 # For Tailscale, WEBSERVER_URL would be something like http://webserver.machine-name.ts.net:8000

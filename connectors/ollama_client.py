@@ -39,3 +39,25 @@ class OllamaClient:
         except Exception as e:
             logger.error(f"Ollama failed to generate score: {e}")
             return 0.5 # Return neutral score on failure
+
+    def chat(self, messages: list, tools: list = None, model: str = "gemma4:e4b") -> dict:
+        """Agentic chat supporting tool/function calling."""
+        logger.debug(f"Chat completion with {model}, {len(messages)} messages, {len(tools) if tools else 0} tools.")
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False
+        }
+        if tools:
+            payload["tools"] = tools
+
+        try:
+            response = requests.post(f"{self.base_url}/api/chat", json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("message", {})
+        except Exception as e:
+            logger.error(f"Ollama chat failed: {e}")
+            return {"role": "assistant", "content": f"Error: {e}"}
+
+
