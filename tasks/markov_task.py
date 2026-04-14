@@ -22,10 +22,14 @@ def run_markov_task(api_client: WebserverClient):
         regime_state = detector.detect_current_regime(df)
         
         # 3. Create POST payload
+        # Find integer ID for the current regime string
+        regime_id_map = {v: k for k, v in detector.regime_order.items()}
+        current_regime_id = int(regime_id_map.get(regime_state.current_regime, 0))
+
         payload = {
             "execution_date": datetime.date.today().isoformat(),
-            "current_regime": regime_state.current_regime,
-            "regime_probability": regime_state.regime_probability,
+            "current_regime": current_regime_id,
+            "regime_probability": float(regime_state.regime_probability),
             # transition_matrix will need `.tolist()` for JSON serialization
             "transition_matrix": regime_state.transition_matrix.tolist() if hasattr(regime_state.transition_matrix, "tolist") else regime_state.transition_matrix,
             "probability_next_regime": regime_state.probability_next_regime

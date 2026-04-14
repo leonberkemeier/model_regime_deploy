@@ -126,7 +126,7 @@ class MarkovChainRegimeDetector:
         volatility = returns.rolling(window=vol_window).std()
         
         # Combine into feature matrix
-        features = np.column_stack([returns.values[vol_window-1:], volatility.values[vol_window:]])
+        features = np.column_stack([returns.values[vol_window-1:], volatility.values[vol_window-1:]])
         
         # Handle NaN values
         features = np.nan_to_num(features, nan=0.0)
@@ -144,9 +144,22 @@ class MarkovChainRegimeDetector:
         """
         self.logger.info(f"Fitting HMM with {self.n_states} states to {len(prices)} price points")
         
-        # Extract features
-        features = self._extract_features(prices)
+        if not prices.index.is_monotonic_increasing:
+            prices = prices.sort_index()
+
+        prices = prices.ffill().bfill()
         
+        # Extract features
+        features = self._extract_features(prices, vol_window=20)
+        
+        # Check if we have enough data samples after feature extraction
+        if len(features) < 1:
+            # If not enough data with default vol_window=20, try finding how many periods we can use, e.g. vol_window=5
+            fallback_window = 5
+            features = self._extract_features(prices, vol_window=fallback_window)
+            if len(features) < 1:
+                raise ValueError("Not enough overlapping valid data points to extract features.")
+
         # Standardize features for HMM
         self.scaler_mean = features.mean(axis=0)
         self.scaler_std = features.std(axis=0)
@@ -220,10 +233,20 @@ class MarkovChainRegimeDetector:
         lookback = lookback or self.lookback_days
         
         # Use recent data
+        
+        if not prices.index.is_monotonic_increasing:
+            prices = prices.sort_index()
+
+        prices = prices.ffill().bfill()
+        
         recent_prices = prices.tail(lookback)
         
         # Extract features
-        features = self._extract_features(recent_prices)
+        fallback_window = 5 if len(recent_prices) < 25 else 20
+        features = self._extract_features(recent_prices, vol_window=fallback_window)
+        if len(features) < 1:
+            raise ValueError(f"Not enough valid data points ({len(recent_prices)}) to extract features. Please lower lookback or provide more data.")
+        
         
         # Standardize using fitted scalers
         features_scaled = (features - self.scaler_mean) / self.scaler_std
@@ -251,13 +274,26 @@ class MarkovChainRegimeDetector:
         
         # Extract regime features from latest data
         latest_returns = recent_prices.pct_change().iloc[-20:].mean()
+        if isinstance(latest_returns, pd.Series):
+            latest_returns = latest_returns.mean()
+            
         latest_volatility = recent_prices.pct_change().iloc[-20:].std()
+        if isinstance(latest_volatility, pd.Series):
+            latest_volatility = latest_volatility.mean()
+            
+        ret_trend = recent_prices.pct_change().iloc[-5:].mean()
+        if isinstance(ret_trend, pd.Series):
+            ret_trend = ret_trend.mean()
+            
+        vol_trend = recent_prices.pct_change().iloc[-5:].std()
+        if isinstance(vol_trend, pd.Series):
+            vol_trend = vol_trend.mean()
         
         regime_features = {
             "mean_return": float(latest_returns),
             "volatility": float(latest_volatility),
-            "return_trend": float(recent_prices.pct_change().iloc[-5:].mean()),
-            "volatility_trend": float(recent_prices.pct_change().iloc[-5:].std()),
+            "return_trend": float(ret_trend),
+            "volatility_trend": float(vol_trend),
         }
         
         state = MarkovRegimeState(

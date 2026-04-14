@@ -16,9 +16,9 @@ class WebserverClient:
         data = response.json()
         
         # Reconstruct DataFrame from JSON format
-        # Assumes data['prices'] holds the list or dict mapping. 
-        # Typically you'd reconstruct the MultiIndex or normal columns
-        df = pd.DataFrame(data.get('prices', {}))
+        # If it's a list directly, use it. If dict, extract 'prices'.
+        prices_data = data.get('prices', {}) if isinstance(data, dict) else data
+        df = pd.DataFrame(prices_data)
         
         if 'date' in df.columns:
             df['date'] = pd.to_datetime(df['date'])
