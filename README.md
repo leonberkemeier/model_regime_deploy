@@ -14,8 +14,8 @@ The `deploy_on_ai-pc` folder is the **"Heavy-Lifting Brain"** of the architectur
 
 Instead of keeping an expensive AI/ML server running 24/7, this lightweight Python daemon sleeps most of the day. When scheduled (e.g., 08:00 AM daily), it wakes up and executes the following sequence:
 
-1. **Fetches Context:** Reaches out to the Webserver via REST API to download the latest aggregated OHLCV asset prices.
-2. **Markov Chain Detection (Phase 1):** Uses `hmmlearn` to analyze the price data and determine the current overall "Market Regime" (e.g., Bull Market, High Volatility, Bear Market).
+1. **Fetches Context:** Reaches out to data providers via `yfinance` directly (or via Webserver REST API fallback) to download the latest aggregated OHLCV asset prices.
+2. **Markov Chain & Data Logging (Phase 1):** Uses `hmmlearn` to sequentially evaluate a list of stocks daily. It analyzes price history, classifies current "Market Regimes" (e.g. Bull Market, High Volatility Chop, Sideways / Quiet, Bear Market) dynamically using statistical variance, captures the confidence probability score, and actively saves these parameters to a local SQLite database (`regimes.db`).
 3. **Enhanced Monte Carlo (Phase 2):** Runs 10,000 simulations per asset using `numpy` and `pandas` to calculate maximum drawdown, Value at Risk (VaR), and Expected Shortfall based on the current regime.
 4. **Local LLM Scoring & RAG (Phase 3):** The locally running **Ollama** model (e.g., gemma4:e4b) directly queries an **SQLite database** for structured financial metrics and performs Retrieval-Augmented Generation (**RAG**) against a **Vector Database** containing unstructured data (reports, news). Combining these sources, it calculates and assigns a 0.0 to 1.0 "Suitability Score".
 5. **Data Push & Trigger (Phase 4):** Pushes all these scores and predictive states formatting as JSON back to the Webserver's database, then triggers the Webserver to build the final trading portfolio.

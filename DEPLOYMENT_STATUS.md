@@ -1,33 +1,27 @@
-# AI-PC Deployment & Testing Progress (Apr 14, 2026)
+# AI-PC Deployment & Testing Progress (Apr 15, 2026)
 
 ## 🎯 Current Project Status
-We have successfully deployed the **AI-PC compute node** (running Arch Linux) and connected its local analytical scripts to the central financial **Webserver (MCP + REST)** endpoints. 
+We have successfully deployed the **AI-PC compute node** (running Arch Linux) and updated its local analytical scripts. We successfully migrated from relying solely on the central financial Webserver for data to an autonomous, direct-fetch capability using `yfinance`.
 
-The primary milestone achieved is the complete automation and validation of the purely mathematical Python code—specifically the **Hidden Markov Model (HMM)** simulation—against real-time Webserver data rather than synthetic mock data. The AI-PC now routinely syncs over the Zero-Trust Tailscale VPN and parses the real financial API feed successfully.
+The primary milestone achieved is the complete automation, refinement, and validation of the purely mathematical Python code—specifically the **Hidden Markov Model (HMM)** simulation. The AI-PC now routinely syncs real-world data, applies advanced clustering (mean return + standard deviation volatility), and exports the tracked regimes to a local SQLite database for downstream AI and dashboard consumption.
 
 ### ✅ What We've Achieved
 1. **Environment Initialization:**
    * Resolved strict `pip` environments on Arch Linux. Built a dedicated Python `venv`.
-   * Installed critical ML, Data, and AI libs (`numpy`, `pandas`, `hmmlearn`, `mcp`, `python-dotenv`, `loguru`).
-2. **Daemonization:**
-   * Converted the Python scheduler into a robust background `systemd` service (`model-agent.service`).
-3. **Agentic MCP Implementation:**
-   * Fully modernized `tasks/llm_task.py` to be a generic MCP client. It loops natively through Ollama (`gemma4:e4b`) to request remote tool execution via `mcp.client.sse`.
-4. **Network & Routing Corrections:**
-   * Diagnosed the 404 network failure. We discovered the Webserver splits its traffic across two ports:
-     * `9876`: FastMCP SSE Server
-     * `9875`: REST API (FastAPI/Uvicorn)
-   * Re-routed all `WebserverClient` data fetching to the proper `:9875` REST interface.
-5. **Math & Pandas Data Debugging (Markov Chain):**
-   * **Data Ingestion:** Mapped FastAPI's JSON `list` responses seamlessly into Pandas Multi-Asset DataFrames.
-   * **Missing Data Handling:** Real world OHLCV contains `NaN` gaps (e.g., from holiday/weekend discrepancies). We patched the pipeline with `ffill().bfill()` to avoid triggering division-by-zero crashes within the `sklearn` scalers.
-   * **Dynamic Rolling Windows:** Handled tiny datasets (the Webserver only returned 30 days history) by applying a fallback `vol_window` to successfully compile historical features without raising "0 samples" exceptions.
-   * **Regime Status Types:** Fixed aggregation crashes when evaluating multi-asset `pd.Series` into JSON serializable floats.
-6. **REST Schema Alignment:**
-   * Remapped the Markov detector's output `current_regime` from a String (e.g. "Bull") back to an Integer ID before submitting the `POST /api/analysis/markov` request to bypass the Webserver’s `422 Unprocessable Entity` Pydantic strict schemas.
-7. **Git Repository Hygiene:**
+   * Added `yfinance` to `requirements.txt` to bypass webserver API data limits.
+2. **Direct Market Data Ingestion (yfinance):**
+   * Modified `WebserverClient` and task scripts to conditionally use `source="yfinance"`, pulling extensive multi-year historical datasets required for accurate matrix generation.
+3. **Math & Pandas Data Debugging (Markov Chain):**
+   * **Mathematical Accuracy:** Fixed a critical bug in `markov_chain_detector.py` where regime prediction confidence was stuck at 100% horizontally. Replaced point-in-time extraction with full-sequence `predict_proba(...)[-1]` analysis.
+   * **Array Alignment:** Corrected index masking offset (`vol_window - 1`) in `filter_returns_by_regime` to accurately map historical returns to their identified states.
+   * **Intelligent Regime Labeling:** Completely rewrote `_identify_regime_order`. HMM states are no longer strictly ranked by mean return. The model now actively classifies 4 states dynamically (Bull, Bear, Sideways / Quiet, High Volatility Chop) by cross-referencing directional returns against standard deviation (volatility).
+4. **Daily SQLite Automation Batching:**
+   * Created a new autonomous script: `tasks/sqlite_regime_task.py`.
+   * Built a robust SQLite schema (`regimes.db -> daily_regimes` table) storing date, ticker, current state, confidence, mean return, and volatility.
+   * Engineered the task to iterate through a configurable list of tickers (e.g., SPY, TSLA, QQQ, AAPL, MSFT), train unique 60-day predictive HMM models for each, and upsert the daily analytics into the database.
+   * Fixed `sys.path` python import scoping so the job can run effortlessly from cron or standard terminal execution.
+5. **Git Repository Hygiene:**
    * Automatically generated a `.gitignore` to prevent 70MB+ trained model footprint blobs (`*.pkl`), pycache, and virtual environments from crashing GitHub pushes.
-   * Removed pre-existing `models/markov_regime_model.pkl` from GitHub's index blob.
 
 ---
 
