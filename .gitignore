@@ -1,3 +1,8 @@
 *.pkl
 venv/
 __pycache__/
+
+*.db
+**/*.db
+*.pkl
+**/*.pkl
