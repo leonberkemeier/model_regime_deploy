@@ -108,8 +108,28 @@ def run_sqlite_regime_task(tickers=None, db_path="regimes.db"):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     
-    # Define your list of stocks to train here
-    my_stocks = ["SPY", "TSLA", "QQQ", "AAPL", "MSFT"]
+    # Load your list of stocks to train from the local financial_data.db
+    my_stocks = ["SPY", "TSLA", "QQQ", "AAPL", "MSFT"] # Fallback list
+    fin_db_path = Path(project_root) / "financial_data.db"
+    
+    if fin_db_path.exists():
+        try:
+            fin_conn = sqlite3.connect(fin_db_path)
+            fin_cursor = fin_conn.cursor()
+            fin_cursor.execute("SELECT DISTINCT ticker FROM dim_company")
+            db_stocks = [row[0] for row in fin_cursor.fetchall()]
+            
+            # Filter out index tickers (like ^GSPC) if preferred, or keep them all. Let's keep valid tickers.
+            # You can filter by specific conditions if needed.
+            if db_stocks:
+                my_stocks = db_stocks
+                logger.info(f"Loaded {len(my_stocks)} stocks from financial_data.db")
+                
+            fin_conn.close()
+        except Exception as e:
+            logger.error(f"Failed to fetch tickers from financial_data.db: {e}")
+    else:
+        logger.warning(f"financial_data.db not found at {fin_db_path}. Using fallback list.")
     
     run_sqlite_regime_task(tickers=my_stocks)
 
