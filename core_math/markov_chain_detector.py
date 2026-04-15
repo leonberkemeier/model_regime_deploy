@@ -196,19 +196,36 @@ class MarkovChainRegimeDetector:
             self.regime_order = list(range(self.n_states))
             return
         
-        # Mean return is first feature
+        # In features, [0] is mean return, [1] is mean volatility
         mean_returns = self.model.means_[:, 0]
+        mean_vols    = self.model.means_[:, 1]
         
-        # Sort state indices by mean return (descending = Bull first)
-        sorted_indices = np.argsort(mean_returns)[::-1]
-        
-        # Ensure we have enough regime names
-        regime_names = self.REGIME_NAMES[:self.n_states]
-        
-        # Create mapping: state_index → regime_name
         self.regime_order = {}
-        for rank, state_idx in enumerate(sorted_indices):
-            self.regime_order[state_idx] = regime_names[rank]
+        
+        # Base logic for N = 3 states: Highest return = Bull, Lowest return = Bear
+        if self.n_states == 3:
+            bull_idx = np.argmax(mean_returns)
+            bear_idx = np.argmin(mean_returns)
+            
+            for i in range(self.n_states):
+                if i == bull_idx:
+                    self.regime_order[i] = "Bull"
+                elif i == bear_idx:
+                    self.regime_order[i] = "Bear"
+                else:
+                    # The "Middle" state. If its volatility is above average, it's Chop. Else, Sideways.
+                    if mean_vols[i] >= np.median(mean_vols):
+                        self.regime_order[i] = "High Volatility Chop"
+                    else:
+                        self.regime_order[i] = "Sideways / Quiet"
+        else:
+            # Fallback for other N amounts (just sorts by return)
+            sorted_indices = np.argsort(mean_returns)[::-1]
+            regime_mapping = ["Bull", "Recovery", "Sideways", "Volatility Spike", "Bear"][:self.n_states]
+            if len(regime_mapping) < self.n_states:
+                regime_mapping = [f"Regime {x}" for x in range(self.n_states)]
+            for rank, state_idx in enumerate(sorted_indices):
+                self.regime_order[state_idx] = regime_mapping[rank]
         
         self.logger.debug(f"Regime order: {self.regime_order}")
     
@@ -255,8 +272,9 @@ class MarkovChainRegimeDetector:
         hidden_states = self.model.predict(features_scaled)
         current_state_idx = hidden_states[-1]
         
-        # Get state probabilities for latest data point
-        state_probs = self.model.predict_proba(features_scaled[-1:]).flatten()
+        # Get state probabilities for the sequence, then take the last day's probabilities
+        state_probs_sequence = self.model.predict_proba(features_scaled)
+        state_probs = state_probs_sequence[-1]
         current_regime_prob = state_probs[current_state_idx]
         
         # Get current regime name
@@ -425,7 +443,7 @@ class MarkovChainRegimeDetector:
         
         # Align mask with returns (feature extraction offsets)
         vol_window = 20
-        mask = np.append(np.zeros(vol_window, dtype=bool), mask)[:len(returns)]
+        mask = np.append(np.zeros(vol_window - 1, dtype=bool), mask)[:len(returns)]
         
         filtered_returns = returns[mask]
         

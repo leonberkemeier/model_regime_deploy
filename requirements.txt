@@ -7,3 +7,4 @@ schedule>=1.2.0
 mcp
 python-dotenv
 loguru
+yfinance>=0.2.0

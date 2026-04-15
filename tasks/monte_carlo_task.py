@@ -10,7 +10,12 @@ def run_monte_carlo_task(api_client: WebserverClient):
     
     try:
         # 1. Fetch dependencies from webserver
-        df = api_client.get_prices()
+        # Using yfinance for direct stock fetches, but you can switch to source="webserver"
+        df = api_client.get_prices(
+            source="yfinance", 
+            yfinance_tickers="AAPL MSFT GOOG AMZN", 
+            period="5y"
+        )
         regime_state = api_client.get_markov_state() # Need current regime state
         
         # 2. Run simulation

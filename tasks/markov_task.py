@@ -12,7 +12,8 @@ def run_markov_task(api_client: WebserverClient):
     
     try:
         # 1. Fetch data
-        df = api_client.get_prices()
+        # Temporarily using yfinance for stocks directly as requested, but you can switch back to source="webserver"
+        df = api_client.get_prices(source="yfinance", yfinance_tickers="^GSPC", period="5y")
         
         # 2. Run core math (Requires clean dataframe)
         detector = MarkovChainRegimeDetector(n_states=5)

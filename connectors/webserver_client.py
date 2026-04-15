@@ -9,7 +9,26 @@ class WebserverClient:
     def __init__(self, base_url):
         self.base_url = base_url
 
-    def get_prices(self) -> pd.DataFrame:
+    def get_prices(self, source="webserver", yfinance_tickers="^GSPC", period="1y") -> pd.DataFrame:
+        if source == "yfinance":
+            logger.info(f"Fetching latest prices directly from yfinance for {yfinance_tickers}...")
+            try:
+                import yfinance as yf
+            except ImportError:
+                raise ImportError("yfinance not installed. Please install with: pip install yfinance")
+            
+            df = yf.download(yfinance_tickers, period=period)
+            # Ensure index name is date
+            df.index.name = 'date'
+            
+            # If multiple tickers, df.Close is a DataFrame. If single ticker, df['Close'] might be a Series in older yfinance,
+            # but in newer yfinance, df['Close'] is a DataFrame if multiple tickers are passed.
+            if isinstance(df.columns, pd.MultiIndex):
+                # Flatten or select just the Close prices
+                return df['Close']
+            else:
+                return df[['Close']].rename(columns={'Close': yfinance_tickers})
+            
         logger.info(f"Fetching latest prices from {self.base_url}/api/data/latest...")
         response = requests.get(f"{self.base_url}/api/data/latest")
         response.raise_for_status()
