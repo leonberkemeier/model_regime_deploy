@@ -13,13 +13,16 @@ if project_root not in sys.path:
 logger = logging.getLogger(__name__)
 
 def init_mc_table(conn):
-    """Initialize SQLite table for storing daily Monte Carlo results."""
+    """Initialize or migrate SQLite table for storing daily Monte Carlo results."""
     cursor = conn.cursor()
+
+    # Ensure table exists (latest schema)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS daily_monte_carlo (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT,
             ticker TEXT,
+            lookback_days INTEGER,
             horizon_days INTEGER,
             simulations INTEGER,
             mean_expected_return REAL,
@@ -30,9 +33,65 @@ def init_mc_table(conn):
             es_99 REAL,
             prob_loss REAL,
             prob_positive REAL,
-            UNIQUE(date, ticker, horizon_days)
+            UNIQUE(date, ticker, lookback_days, horizon_days)
         )
     ''')
+
+    # Backward-compatible migration from old schema
+    cursor.execute("PRAGMA table_info(daily_monte_carlo)")
+    existing_columns = [row[1] for row in cursor.fetchall()]
+
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_monte_carlo'")
+    create_sql_row = cursor.fetchone()
+    create_sql = (create_sql_row[0] if create_sql_row and create_sql_row[0] else "").lower().replace(" ", "")
+
+    has_old_unique_key = "unique(date,ticker,horizon_days)" in create_sql
+    needs_migration = ("lookback_days" not in existing_columns) or has_old_unique_key
+
+    if needs_migration:
+        logger.info("Migrating daily_monte_carlo schema to include lookback_days in uniqueness key...")
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS daily_monte_carlo_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
+                ticker TEXT,
+                lookback_days INTEGER,
+                horizon_days INTEGER,
+                simulations INTEGER,
+                mean_expected_return REAL,
+                median_expected_return REAL,
+                var_95 REAL,
+                var_99 REAL,
+                es_95 REAL,
+                es_99 REAL,
+                prob_loss REAL,
+                prob_positive REAL,
+                UNIQUE(date, ticker, lookback_days, horizon_days)
+            )
+        ''')
+
+        if "lookback_days" in existing_columns:
+            cursor.execute('''
+                INSERT OR REPLACE INTO daily_monte_carlo_new
+                (date, ticker, lookback_days, horizon_days, simulations, mean_expected_return, median_expected_return,
+                 var_95, var_99, es_95, es_99, prob_loss, prob_positive)
+                SELECT date, ticker, lookback_days, horizon_days, simulations, mean_expected_return, median_expected_return,
+                       var_95, var_99, es_95, es_99, prob_loss, prob_positive
+                FROM daily_monte_carlo
+            ''')
+        else:
+            cursor.execute('''
+                INSERT OR REPLACE INTO daily_monte_carlo_new
+                (date, ticker, lookback_days, horizon_days, simulations, mean_expected_return, median_expected_return,
+                 var_95, var_99, es_95, es_99, prob_loss, prob_positive)
+                SELECT date, ticker, 60, horizon_days, simulations, mean_expected_return, median_expected_return,
+                       var_95, var_99, es_95, es_99, prob_loss, prob_positive
+                FROM daily_monte_carlo
+            ''')
+
+        cursor.execute("DROP TABLE daily_monte_carlo")
+        cursor.execute("ALTER TABLE daily_monte_carlo_new RENAME TO daily_monte_carlo")
+
     conn.commit()
 
 def run_sqlite_monte_carlo_task(db_path="regimes.db", horizon_days=20, n_simulations=10000):
@@ -50,7 +109,7 @@ def run_sqlite_monte_carlo_task(db_path="regimes.db", horizon_days=20, n_simulat
     
     # 1. Fetch latest HMM properties for today
     cursor.execute('''
-        SELECT ticker, mean_return, volatility, current_state
+        SELECT ticker, lookback_days, mean_return, volatility, current_state
         FROM daily_regimes 
         WHERE date = ?
     ''', (today_str,))
@@ -65,7 +124,7 @@ def run_sqlite_monte_carlo_task(db_path="regimes.db", horizon_days=20, n_simulat
     
     np.random.seed(42) # For reproducibility
     
-    for ticker, mean, vol, state in daily_regimes:
+    for ticker, lookback_days, mean, vol, state in daily_regimes:
         try:
             # 2. Simulate Forward Paths directly from the HMM's exact state parameters
             daily_returns = np.random.normal(
@@ -93,13 +152,16 @@ def run_sqlite_monte_carlo_task(db_path="regimes.db", horizon_days=20, n_simulat
             # 4. Save to Database
             cursor.execute('''
                 INSERT OR REPLACE INTO daily_monte_carlo 
-                (date, ticker, horizon_days, simulations, mean_expected_return, median_expected_return, 
+                (date, ticker, lookback_days, horizon_days, simulations, mean_expected_return, median_expected_return, 
                  var_95, var_99, es_95, es_99, prob_loss, prob_positive)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (today_str, ticker, horizon_days, n_simulations, 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (today_str, ticker, int(lookback_days), horizon_days, n_simulations, 
                   mean_ret, median_ret, var_95, var_99, es_95, es_99, prob_loss, prob_pos))
             
-            logger.info(f"✅ {ticker} (State: {state}) -> horizon: {horizon_days}d | VaR-95: {var_95:.2%} | Prob Loss: {prob_loss:.1%}")
+            logger.info(
+                f"✅ {ticker} [{lookback_days}d regime | State: {state}] -> "
+                f"horizon: {horizon_days}d | VaR-95: {var_95:.2%} | Prob Loss: {prob_loss:.1%}"
+            )
             
         except Exception as e:
             logger.error(f"❌ Failed simulating {ticker}: {e}")

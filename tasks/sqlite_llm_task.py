@@ -23,7 +23,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:1.5b")
 logger = logging.getLogger(__name__)
 
 def init_llm_table(conn):
-    """Initialize SQLite table for storing daily LLM conviction scores."""
+    """Initialize SQLite table for storing daily fused LLM conviction scores."""
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS daily_llm_conviction (
@@ -34,12 +34,57 @@ def init_llm_table(conn):
             var_95 REAL,
             mean_expected_return REAL,
             prob_loss REAL,
+            hmm_state_14d TEXT,
+            hmm_state_60d TEXT,
+            var_95_14d REAL,
+            var_95_60d REAL,
+            mean_expected_return_14d REAL,
+            mean_expected_return_60d REAL,
+            prob_loss_14d REAL,
+            prob_loss_60d REAL,
             conviction_score REAL,
             reasoning TEXT,
             UNIQUE(date, ticker)
         )
     ''')
+
+    # Backward-compatible migration for existing DBs
+    cursor.execute("PRAGMA table_info(daily_llm_conviction)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    required_columns = {
+        "hmm_state_14d": "TEXT",
+        "hmm_state_60d": "TEXT",
+        "var_95_14d": "REAL",
+        "var_95_60d": "REAL",
+        "mean_expected_return_14d": "REAL",
+        "mean_expected_return_60d": "REAL",
+        "prob_loss_14d": "REAL",
+        "prob_loss_60d": "REAL",
+    }
+
+    for column_name, column_type in required_columns.items():
+        if column_name not in existing_columns:
+            cursor.execute(
+                f"ALTER TABLE daily_llm_conviction ADD COLUMN {column_name} {column_type}"
+            )
+
     conn.commit()
+
+
+def _fmt_pct(value):
+    """Format probability/return values for prompts."""
+    if value is None:
+        return "N/A"
+    return f"{float(value):.2%}"
+
+
+def _avg_available(*values):
+    """Average non-null numeric values; return None if all values are null."""
+    non_null = [float(v) for v in values if v is not None]
+    if not non_null:
+        return None
+    return sum(non_null) / len(non_null)
 
 def query_ollama(prompt: str) -> dict:
     """Send a prompt to the local Ollama instance and parse the JSON response."""
@@ -67,7 +112,7 @@ def query_ollama(prompt: str) -> dict:
         logger.error(f"Failed to parse Ollama JSON: {e} - Raw: {result_text}")
         return {}
 
-def run_sqlite_llm_task(db_path="regimes.db"):
+def run_sqlite_llm_task(db_path="regimes.db", horizon_days=20):
     """
     Fetch the HMM and Monte Carlo metrics for today from regimes.db.
     Feed them to the local Ollama LLM to generate a Conviction Score (-1.0 to 1.0).
@@ -81,14 +126,28 @@ def run_sqlite_llm_task(db_path="regimes.db"):
     init_llm_table(conn)
     cursor = conn.cursor()
     
-    # 1. Fetch latest HMM + MC properties for today
-    # JOIN daily_regimes and daily_monte_carlo
+    # 1. Fetch 14d and 60d HMM + MC properties for today and fuse them per ticker
     cursor.execute('''
-        SELECT r.ticker, r.current_state, m.var_95, m.mean_expected_return, m.prob_loss
+        SELECT
+            r.ticker,
+            MAX(CASE WHEN r.lookback_days = 14 THEN r.current_state END) AS hmm_state_14d,
+            MAX(CASE WHEN r.lookback_days = 60 THEN r.current_state END) AS hmm_state_60d,
+            MAX(CASE WHEN m.lookback_days = 14 THEN m.var_95 END) AS var_95_14d,
+            MAX(CASE WHEN m.lookback_days = 60 THEN m.var_95 END) AS var_95_60d,
+            MAX(CASE WHEN m.lookback_days = 14 THEN m.mean_expected_return END) AS mean_expected_return_14d,
+            MAX(CASE WHEN m.lookback_days = 60 THEN m.mean_expected_return END) AS mean_expected_return_60d,
+            MAX(CASE WHEN m.lookback_days = 14 THEN m.prob_loss END) AS prob_loss_14d,
+            MAX(CASE WHEN m.lookback_days = 60 THEN m.prob_loss END) AS prob_loss_60d
         FROM daily_regimes r
-        JOIN daily_monte_carlo m ON r.ticker = m.ticker AND r.date = m.date
+        LEFT JOIN daily_monte_carlo m
+            ON r.ticker = m.ticker
+            AND r.date = m.date
+            AND r.lookback_days = m.lookback_days
+            AND m.horizon_days = ?
         WHERE r.date = ?
-    ''', (today_str,))
+        GROUP BY r.ticker
+        ORDER BY r.ticker
+    ''', (horizon_days, today_str))
     
     assets = cursor.fetchall()
     
@@ -98,18 +157,49 @@ def run_sqlite_llm_task(db_path="regimes.db"):
 
     logger.info(f"Found {len(assets)} assets to analyze with {OLLAMA_MODEL}...")
     
-    for ticker, state, var_95, mean_ret, prob_loss in assets:
+    for (
+        ticker,
+        state_14d,
+        state_60d,
+        var_95_14d,
+        var_95_60d,
+        mean_ret_14d,
+        mean_ret_60d,
+        prob_loss_14d,
+        prob_loss_60d,
+    ) in assets:
         logger.info(f"Analyzing {ticker}...")
+
+        if all(v is None for v in [var_95_14d, var_95_60d, mean_ret_14d, mean_ret_60d, prob_loss_14d, prob_loss_60d]):
+            logger.warning(f"Skipping {ticker}: no Monte Carlo metrics found for either 14d or 60d lookback.")
+            continue
+
+        state_14d_display = state_14d or "N/A"
+        state_60d_display = state_60d or "N/A"
+
+        fused_hmm_state = f"14d={state_14d_display} | 60d={state_60d_display}"
+        fused_var_95 = _avg_available(var_95_14d, var_95_60d)
+        fused_mean_ret = _avg_available(mean_ret_14d, mean_ret_60d)
+        fused_prob_loss = _avg_available(prob_loss_14d, prob_loss_60d)
         
         # 2. Formulate the strictly constrained Prompt
         prompt = f"""You are a quantitative financial analyst evaluating the asset {ticker}.
-Based on our math models for today:
-- Market Regime State: {state}
-- 20-Day 95% Value at Risk (VaR-95): {var_95:.2%}
-- Expected Mean Return: {mean_ret:.2%}
-- Probability of Loss: {prob_loss:.1%}
+Based on two horizon-aware model views for today, produce one consolidated investment conviction.
 
-Evaluate this asset's risk/reward profile. Convert this quantitative risk profile into a single Conviction Score between -1.0 (Strong Sell) and 1.0 (Strong Buy).
+Short-Term View (14-day regime):
+- Market Regime State: {state_14d_display}
+- {horizon_days}-Day 95% Value at Risk (VaR-95): {_fmt_pct(var_95_14d)}
+- Expected Mean Return: {_fmt_pct(mean_ret_14d)}
+- Probability of Loss: {_fmt_pct(prob_loss_14d)}
+
+Long-Term View (60-day regime):
+- Market Regime State: {state_60d_display}
+- {horizon_days}-Day 95% Value at Risk (VaR-95): {_fmt_pct(var_95_60d)}
+- Expected Mean Return: {_fmt_pct(mean_ret_60d)}
+- Probability of Loss: {_fmt_pct(prob_loss_60d)}
+
+Evaluate this asset's risk/reward profile by balancing short-term and long-term signals.
+Return a single Conviction Score between -1.0 (Strong Sell) and 1.0 (Strong Buy).
 
 Respond ONLY with a valid JSON object in this exact format, with no markdown formatting or extra text:
 {{
@@ -138,9 +228,30 @@ Respond ONLY with a valid JSON object in this exact format, with no markdown for
         try:
             cursor.execute('''
                 INSERT OR REPLACE INTO daily_llm_conviction 
-                (date, ticker, hmm_state, var_95, mean_expected_return, prob_loss, conviction_score, reasoning)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (today_str, ticker, state, float(var_95), float(mean_ret), float(prob_loss), score, reasoning))
+                (date, ticker, hmm_state, var_95, mean_expected_return, prob_loss,
+                 hmm_state_14d, hmm_state_60d, var_95_14d, var_95_60d,
+                 mean_expected_return_14d, mean_expected_return_60d,
+                 prob_loss_14d, prob_loss_60d,
+                 conviction_score, reasoning)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                today_str,
+                ticker,
+                fused_hmm_state,
+                fused_var_95,
+                fused_mean_ret,
+                fused_prob_loss,
+                state_14d,
+                state_60d,
+                var_95_14d,
+                var_95_60d,
+                mean_ret_14d,
+                mean_ret_60d,
+                prob_loss_14d,
+                prob_loss_60d,
+                score,
+                reasoning,
+            ))
             conn.commit()
         except Exception as e:
             logger.error(f"❌ Failed to save {ticker} to DB: {e}")
