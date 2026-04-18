@@ -17,6 +17,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
+import sqlite3
 from loguru import logger
 
 # Add project root to path
@@ -204,6 +205,57 @@ def train_hmm(
     logger.info(f"  [14-Day Model]: {state_14d.current_regime.upper()} (Confidence: {state_14d.regime_probability:.1%})")
     logger.info(f"  [60-Day Model]: {state_60d.current_regime.upper()} (Confidence: {state_60d.regime_probability:.1%})")
     
+
+    # Database Saving Logic
+    try:
+        conn = sqlite3.connect(Path(project_root) / "regimes.db")
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS daily_regimes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
+                ticker TEXT,
+                lookback_days INTEGER,
+                current_state TEXT,
+                confidence REAL,
+                mean_return REAL,
+                volatility REAL,
+                UNIQUE(date, ticker, lookback_days)
+            )
+        ''')
+        
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        
+        # Save 14-day
+        m_ret_14, vol_14 = 0.0, 0.0
+        if state_14d.current_regime in detector_14d.regime_order.values():
+            stats = detector_14d.get_regime_statistics(prices, state_14d.current_regime)
+            m_ret_14, vol_14 = stats.get('mean_return', 0.0), stats.get('std_return', 0.0)
+            
+        cursor.execute('''
+            INSERT OR REPLACE INTO daily_regimes 
+            (date, ticker, lookback_days, current_state, confidence, mean_return, volatility)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (today_str, ticker, 14, state_14d.current_regime, float(state_14d.regime_probability), m_ret_14, vol_14))
+        
+        # Save 60-day
+        m_ret_60, vol_60 = 0.0, 0.0
+        if state_60d.current_regime in detector_60d.regime_order.values():
+            stats = detector_60d.get_regime_statistics(prices, state_60d.current_regime)
+            m_ret_60, vol_60 = stats.get('mean_return', 0.0), stats.get('std_return', 0.0)
+            
+        cursor.execute('''
+            INSERT OR REPLACE INTO daily_regimes 
+            (date, ticker, lookback_days, current_state, confidence, mean_return, volatility)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (today_str, ticker, 60, state_60d.current_regime, float(state_60d.regime_probability), m_ret_60, vol_60))
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Saved {ticker} regime states to regimes.db (local cache).")
+    except Exception as e:
+        logger.error(f"Failed to save regimes to database: {e}")
+
     # Validation
     if validate:
         logger.info("\n" + "=" * 60)
