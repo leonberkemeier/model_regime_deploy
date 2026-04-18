@@ -1,4 +1,4 @@
-# AI-PC Deployment & Testing Progress (Apr 15, 2026)
+# AI-PC Deployment & Testing Progress (Apr 18, 2026)
 
 ## 🎯 Current Project Status
 We have successfully deployed the **AI-PC compute node** (running Arch Linux) and updated its local analytical scripts. We successfully migrated from relying solely on the central financial Webserver for data to an autonomous, direct-fetch capability using `yfinance`.
@@ -38,9 +38,9 @@ The primary milestone achieved is the complete automation, refinement, and valid
 With Phase 1 (HMM) and Phase 2 (Monte Carlo) fully completed, the rigorous statistical math pipeline is fully operational. The next phases transition entirely into AI-driven logic and portfolio construction:
 
 1. **Pillar 3: The LLM "Conviction Synthesis" (`llm_task.py`)**
-   * Wire up the local **Ollama** model (`gemma4:e4b`) to act as the Senior Analyst.
-   * Loop through the `daily_monte_carlo` SQLite data, feed the metrics (VaR, Mean Return, Probability of Loss) to the LLM, and have it output a modified **Conviction Score** (`p_final`).
-   * Integrate RAG (Retrieval-Augmented Generation) via the MCP connection to inject qualitative context (SEC filings, news) so the LLM can fuse the *Numbers* with the *Narrative*.
+   * Wire up the local **Ollama** model (e.g., `deepseek-r1:1.5b`) to act as the Senior Analyst. *Note: Ensure the target model is dynamically configurable via the `.env` file for fast local testing.*
+   * Build the SQLite loop: Read `daily_monte_carlo` records (VaR, Mean Return, Probability of Loss), parse that quantitative data into a prompt, and ask the LLM to output a modified **Conviction Score** (`p_final`).
+   * *Phase 3B:* Integrate RAG (Retrieval-Augmented Generation) via the MCP connection to inject qualitative context (SEC filings, news) so the LLM can fuse the *Numbers* with the *Narrative*.
 
 2. **Pillar 4: The "Risk-Factor Envelopes" (Portfolio Construction)**
    * Create a new execution script (e.g., `tasks/portfolio_builder.py`) to systematically filter the 700+ scored assets into 5 distinct Strategic Asset Allocation (SAA) profiles (Conservative -> Aggressive).
