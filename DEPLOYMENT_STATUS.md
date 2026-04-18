@@ -15,13 +15,15 @@ The primary milestone achieved is the complete automation, refinement, and valid
    * **Mathematical Accuracy:** Fixed a critical bug in `markov_chain_detector.py` where regime prediction confidence was stuck at 100% horizontally. Replaced point-in-time extraction with full-sequence `predict_proba(...)[-1]` analysis.
    * **Array Alignment:** Corrected index masking offset (`vol_window - 1`) in `filter_returns_by_regime` to accurately map historical returns to their identified states.
    * **Intelligent Regime Labeling:** Completely rewrote `_identify_regime_order`. HMM states are no longer strictly ranked by mean return. The model now actively classifies 4 states dynamically (Bull, Bear, Sideways / Quiet, High Volatility Chop) by cross-referencing directional returns against standard deviation (volatility).
-4. **Daily SQLite Automation Batching:**
-   * Created a new autonomous script: `tasks/sqlite_regime_task.py`.
-   * Built a robust SQLite schema (`regimes.db -> daily_regimes` table) storing date, ticker, current state, confidence, mean return, and volatility.
-   * Engineered the task to iterate through a configurable list of tickers (e.g., SPY, TSLA, QQQ, AAPL, MSFT), train unique 60-day predictive HMM models for each, and upsert the daily analytics into the database.
-   * Fixed `sys.path` python import scoping so the job can run effortlessly from cron or standard terminal execution.
-5. **Git Repository Hygiene:**
-   * Automatically generated a `.gitignore` to prevent 70MB+ trained model footprint blobs (`*.pkl`), pycache, and virtual environments from crashing GitHub pushes.
+4. **Daily SQLite Automation Batching (HMM & Monte Carlo):**
+   * Created new autonomous scripts: `tasks/sqlite_regime_task.py` and `tasks/sqlite_monte_carlo_task.py`.
+   * Built a robust SQLite schema (`regimes.db -> daily_regimes` and `daily_monte_carlo` tables).
+   * **Dynamic Asset Discovery:** The runtime automatically connects to the server's `financial_data.db` to infer and process over 700 active stock tickers dynamically.
+   * **Phase 1 (HMM):** Trains unique 60-day predictive HMM models for each stock and upserts the current state, confidence, mean return, and volatility to the database.
+   * **Phase 2 (Monte Carlo):** Directly queries the target HMM properties from `regimes.db`, executing 10,000 forward paths over a 20-day horizon to calculate tail-risk metrics (Value at Risk 95/99, Expected Shortfall, Probability of Loss).
+5. **Git Repository Hygiene & Filtering:**
+   * Used `git filter-branch` to purge massive 100MB+ `.db` and trained `.pkl` model footprints from the repository's deep commit history (which were causing GitHub `push` rejections).
+   * Automatically generated a `.gitignore` covering `*.db`, `*.pkl`, pycache, and virtual environments.
 
 ---
 
@@ -31,20 +33,22 @@ The primary milestone achieved is the complete automation, refinement, and valid
 
 ---
 
-## ⏭️ Next Steps
+## ⏭️ Next Steps: Building Pillars 3, 4, and 5
 
-1. **Validate the Monte Carlo Module (`monte_carlo_task.py`)**
-   * Verify that the Monte Carlo task pulls the newly posted `MarkovRegimeState` properly.
-   * Test if it evaluates the simulated asset future accurately.
-   * Ensure that `POST /api/analysis/monte_carlo/all` validates the same strict Pydantic schemas.
+With Phase 1 (HMM) and Phase 2 (Monte Carlo) fully completed, the rigorous statistical math pipeline is fully operational. The next phases transition entirely into AI-driven logic and portfolio construction:
 
-2. **Validate the LLM Scoring Module (`llm_task.py`)**
-   * Boot up the MCP loop over `http://100.69.76.20:9876`.
-   * Watch the local `gemma4:e4b` Ollama node natively pick up the tools from the remote server, analyze the Markov/MC stats, and synthesize an asset sentiment score payload.
+1. **Pillar 3: The LLM "Conviction Synthesis" (`llm_task.py`)**
+   * Wire up the local **Ollama** model (`gemma4:e4b`) to act as the Senior Analyst.
+   * Loop through the `daily_monte_carlo` SQLite data, feed the metrics (VaR, Mean Return, Probability of Loss) to the LLM, and have it output a modified **Conviction Score** (`p_final`).
+   * Integrate RAG (Retrieval-Augmented Generation) via the MCP connection to inject qualitative context (SEC filings, news) so the LLM can fuse the *Numbers* with the *Narrative*.
 
-3. **Verify the Daemon Loop in Production**
-   * Now that testing local manual tasks passed (`run_markov_task(...)`), allow the AI-PC daemon (`systemd`) to autonomously run the entire scheduled queue of tasks overnight.
-   * Check `/var/log/syslog` tomorrow to see if jobs sequence accurately.
+2. **Pillar 4: The "Risk-Factor Envelopes" (Portfolio Construction)**
+   * Create a new execution script (e.g., `tasks/portfolio_builder.py`) to systematically filter the 700+ scored assets into 5 distinct Strategic Asset Allocation (SAA) profiles (Conservative -> Aggressive).
+   * Enforce strict bucket constraints (e.g., matching the Conservative profile exclusively to low-beta stocks and bonds using the "Cynical Auditor" LLM conviction scores).
 
-4. **Webserver Backend Expansion (Optional)**
-   * Determine if the main FastAPI Webserver server requires modifications to serve longer historical datasets (e.g., 365 Days) to build more stable and comprehensive Regime matrices.
+3. **Pillar 5: The "Gap-Filler" Priority Queue**
+   * Develop the transactional algorithm to handle recurring monthly deposits (e.g., €500/month inflow).
+   * Automatically calculate shortfalls within the target portfolio envelopes and generate optimal fractional buy-tickets to dynamically "buy the dip" and rebalance without triggering excessive commission fees.
+
+4. **Verify the Daemon Loop in Production**
+   * Link all phases end-to-end within the daily daemon schedule (`daemon.py` / `systemd`), ensuring Phase 3 (LLM) triggers strictly following the successful completion of Phase 1 and 2 database writes.
