@@ -141,6 +141,51 @@ def load_tickers_from_db(
     return tickers
 
 
+def load_company_name_from_db(
+    ticker: str,
+    db_path: str,
+    table_name: str = "dim_company",
+    ticker_column: str = "ticker",
+    company_name_column: str = "company_name"
+) -> str | None:
+    """
+    Load company name for a ticker from SQLite table.
+
+    Args:
+        ticker: Ticker symbol to lookup
+        db_path: Path to sqlite database
+        table_name: Source table containing company metadata
+        ticker_column: Column name containing ticker symbol
+        company_name_column: Column name containing company name
+
+    Returns:
+        Company name if found, else None
+    """
+    db_file = Path(db_path)
+    if not db_file.exists():
+        return None
+
+    conn = sqlite3.connect(db_file)
+    try:
+        cursor = conn.cursor()
+        query = f"""
+            SELECT {company_name_column}
+            FROM {table_name}
+            WHERE UPPER(TRIM({ticker_column})) = UPPER(TRIM(?))
+            LIMIT 1
+        """
+        cursor.execute(query, (ticker,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        company_name = row[0]
+        return str(company_name).strip() if company_name else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def train_hmm(
     ticker: str = "SPY",
     start_date: str = "2020-01-01",
@@ -149,7 +194,8 @@ def train_hmm(
     n_iter: int = 100,
     model_path: str = "models/hmm_regime_model.pkl",
     validate: bool = False,
-    exit_on_error: bool = True
+    exit_on_error: bool = True,
+    company_db_path: str = None
 ):
     """
     Train HMM regime detection model.
@@ -190,6 +236,12 @@ def train_hmm(
     logger.info(f"  Period: {start_date} to {end_date}")
     logger.info(f"  Days: {len(prices)}")
     logger.info(f"  Price range: ${float(prices.min()):.2f} - ${float(prices.max()):.2f}")
+
+    if company_db_path is None:
+        company_db_path = str(Path(project_root) / "financial_data.db")
+    company_name = load_company_name_from_db(ticker=ticker, db_path=company_db_path)
+    if company_name:
+        logger.info(f"  Company: {company_name}")
     
     # Train HMM (14-Day Model)
     logger.info(f"\nTraining 14-Day (Short-Term) HMM with {n_states} states ({n_iter} iterations)...")
@@ -269,6 +321,7 @@ def train_hmm(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 date TEXT,
                 ticker TEXT,
+                company_name TEXT,
                 lookback_days INTEGER,
                 current_state TEXT,
                 confidence REAL,
@@ -277,6 +330,12 @@ def train_hmm(
                 UNIQUE(date, ticker, lookback_days)
             )
         ''')
+
+        # Backward-compatible migration for existing DBs
+        cursor.execute("PRAGMA table_info(daily_regimes)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "company_name" not in existing_columns:
+            cursor.execute("ALTER TABLE daily_regimes ADD COLUMN company_name TEXT")
         
         today_str = datetime.now().strftime("%Y-%m-%d")
         
@@ -288,9 +347,9 @@ def train_hmm(
             
         cursor.execute('''
             INSERT OR REPLACE INTO daily_regimes 
-            (date, ticker, lookback_days, current_state, confidence, mean_return, volatility)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (today_str, ticker, 14, state_14d.current_regime, float(state_14d.regime_probability), m_ret_14, vol_14))
+            (date, ticker, company_name, lookback_days, current_state, confidence, mean_return, volatility)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (today_str, ticker, company_name, 14, state_14d.current_regime, float(state_14d.regime_probability), m_ret_14, vol_14))
         
         # Save 60-day
         m_ret_60, vol_60 = 0.0, 0.0
@@ -300,9 +359,9 @@ def train_hmm(
             
         cursor.execute('''
             INSERT OR REPLACE INTO daily_regimes 
-            (date, ticker, lookback_days, current_state, confidence, mean_return, volatility)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (today_str, ticker, 60, state_60d.current_regime, float(state_60d.regime_probability), m_ret_60, vol_60))
+            (date, ticker, company_name, lookback_days, current_state, confidence, mean_return, volatility)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (today_str, ticker, company_name, 60, state_60d.current_regime, float(state_60d.regime_probability), m_ret_60, vol_60))
         
         conn.commit()
         conn.close()
@@ -501,7 +560,8 @@ Examples:
                     n_iter=args.iterations,
                     model_path=ticker_model_path,
                     validate=args.validate,
-                    exit_on_error=False
+                    exit_on_error=False,
+                    company_db_path=args.db_path
                 )
                 success_count += 1
             except Exception as e:
@@ -527,7 +587,8 @@ Examples:
         n_iter=args.iterations,
         model_path=args.model_path.replace('.pkl', f'_{args.ticker}.pkl') if args.ticker != 'SPY' else args.model_path,
         validate=args.validate,
-        exit_on_error=True
+        exit_on_error=True,
+        company_db_path=args.db_path
     )
 
 
