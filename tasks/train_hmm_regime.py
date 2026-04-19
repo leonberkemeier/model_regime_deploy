@@ -9,6 +9,7 @@ Usage:
     python scripts/train_hmm_regime.py
     python scripts/train_hmm_regime.py --ticker QQQ --start 2018-01-01
     python scripts/train_hmm_regime.py --validate
+    python scripts/train_hmm_regime.py --all-tickers
 """
 
 import argparse
@@ -96,6 +97,50 @@ def load_market_data(ticker: str, start_date: str, end_date: str) -> pd.Series:
     )
 
 
+def load_tickers_from_db(
+    db_path: str,
+    table_name: str = "dim_company",
+    ticker_column: str = "ticker",
+    max_tickers: int = None
+) -> list[str]:
+    """
+    Load distinct ticker symbols from SQLite table.
+
+    Args:
+        db_path: Path to sqlite database
+        table_name: Source table containing ticker symbols
+        ticker_column: Column name containing ticker symbols
+        max_tickers: Optional maximum number of tickers to return
+
+    Returns:
+        List of uppercase ticker symbols
+    """
+    db_file = Path(db_path)
+    if not db_file.exists():
+        raise FileNotFoundError(f"Database not found: {db_file}")
+
+    conn = sqlite3.connect(db_file)
+    try:
+        cursor = conn.cursor()
+        query = f"""
+            SELECT DISTINCT TRIM({ticker_column}) AS ticker
+            FROM {table_name}
+            WHERE {ticker_column} IS NOT NULL
+              AND TRIM({ticker_column}) != ''
+            ORDER BY ticker
+        """
+        cursor.execute(query)
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    tickers = [str(row[0]).upper() for row in rows if row and row[0]]
+    if max_tickers is not None:
+        tickers = tickers[:max_tickers]
+
+    return tickers
+
+
 def train_hmm(
     ticker: str = "SPY",
     start_date: str = "2020-01-01",
@@ -103,7 +148,8 @@ def train_hmm(
     n_states: int = 3,
     n_iter: int = 100,
     model_path: str = "models/hmm_regime_model.pkl",
-    validate: bool = False
+    validate: bool = False,
+    exit_on_error: bool = True
 ):
     """
     Train HMM regime detection model.
@@ -129,11 +175,15 @@ def train_hmm(
         prices = load_market_data(ticker, start_date, end_date)
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
-        sys.exit(1)
+        if exit_on_error:
+            sys.exit(1)
+        raise
     
     if len(prices) < 300:
         logger.error(f"Insufficient data: {len(prices)} days (need at least 300)")
-        sys.exit(1)
+        if exit_on_error:
+            sys.exit(1)
+        raise ValueError(f"Insufficient data for {ticker}: {len(prices)} days")
     
     logger.info(f"\nTraining data summary:")
     logger.info(f"  Ticker: {ticker}")
@@ -155,7 +205,9 @@ def train_hmm(
         detector_14d.fit(prices)
     except Exception as e:
         logger.error(f"14-Day Training failed: {e}")
-        sys.exit(1)
+        if exit_on_error:
+            sys.exit(1)
+        raise
         
     # Train HMM (60-Day Model)
     logger.info(f"\nTraining 60-Day (Long-Term) HMM with {n_states} states ({n_iter} iterations)...")
@@ -171,7 +223,9 @@ def train_hmm(
         detector_60d.fit(prices)
     except Exception as e:
         logger.error(f"60-Day Training failed: {e}")
-        sys.exit(1)
+        if exit_on_error:
+            sys.exit(1)
+        raise
     
     # Define a helper function to print statistics
     def print_stats(title, detector, window):
@@ -330,6 +384,12 @@ Examples:
   
   # With validation
   python scripts/train_hmm_regime.py --validate
+
+    # Batch train all tickers from financial_data.db/dim_company
+    python scripts/train_hmm_regime.py --all-tickers
+
+    # Batch train only first 10 tickers
+    python scripts/train_hmm_regime.py --all-tickers --max-tickers 10
         """
     )
     
@@ -338,6 +398,26 @@ Examples:
         type=str,
         default="SPY",
         help="Market index ticker (default: SPY)"
+    )
+
+    parser.add_argument(
+        "--all-tickers",
+        action="store_true",
+        help="Train all tickers from financial_data.db dim_company table"
+    )
+
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default=str(Path(project_root) / "financial_data.db"),
+        help="Path to SQLite DB containing dim_company (default: ./financial_data.db)"
+    )
+
+    parser.add_argument(
+        "--max-tickers",
+        type=int,
+        default=None,
+        help="Optional cap on number of tickers in --all-tickers mode"
     )
     
     parser.add_argument(
@@ -382,8 +462,63 @@ Examples:
     )
     
     args = parser.parse_args()
-    
-    # Train
+
+    if args.all_tickers:
+        try:
+            tickers = load_tickers_from_db(
+                db_path=args.db_path,
+                table_name="dim_company",
+                ticker_column="ticker",
+                max_tickers=args.max_tickers
+            )
+        except Exception as e:
+            logger.error(f"Failed to load tickers from DB: {e}")
+            sys.exit(1)
+
+        if not tickers:
+            logger.error("No tickers found in dim_company table.")
+            sys.exit(1)
+
+        logger.info("=" * 80)
+        logger.info(f"Batch mode enabled: training {len(tickers)} ticker(s) from {args.db_path}")
+        logger.info("=" * 80)
+
+        success_count = 0
+        failed = []
+
+        for idx, ticker in enumerate(tickers, start=1):
+            logger.info("\n" + "-" * 80)
+            logger.info(f"[{idx}/{len(tickers)}] Training ticker: {ticker}")
+            logger.info("-" * 80)
+
+            ticker_model_path = args.model_path.replace('.pkl', f'_{ticker}.pkl')
+            try:
+                train_hmm(
+                    ticker=ticker,
+                    start_date=args.start,
+                    end_date=args.end,
+                    n_states=args.states,
+                    n_iter=args.iterations,
+                    model_path=ticker_model_path,
+                    validate=args.validate,
+                    exit_on_error=False
+                )
+                success_count += 1
+            except Exception as e:
+                logger.error(f"❌ Batch training failed for {ticker}: {e}")
+                failed.append((ticker, str(e)))
+
+        logger.info("\n" + "=" * 80)
+        logger.info("Batch training complete")
+        logger.info(f"Successful: {success_count}/{len(tickers)}")
+        logger.info(f"Failed: {len(failed)}")
+        if failed:
+            for ticker, reason in failed:
+                logger.warning(f"  - {ticker}: {reason}")
+        logger.info("=" * 80)
+        return
+
+    # Single-ticker mode
     train_hmm(
         ticker=args.ticker,
         start_date=args.start,
@@ -391,7 +526,8 @@ Examples:
         n_states=args.states,
         n_iter=args.iterations,
         model_path=args.model_path.replace('.pkl', f'_{args.ticker}.pkl') if args.ticker != 'SPY' else args.model_path,
-        validate=args.validate
+        validate=args.validate,
+        exit_on_error=True
     )
 
 
