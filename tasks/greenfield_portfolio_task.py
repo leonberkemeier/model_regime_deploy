@@ -1,8 +1,13 @@
 import logging
+import sqlite3
+import datetime
+from pathlib import Path
 from connectors.webserver_client import WebserverClient
 from typing import List, Dict
 
 logger = logging.getLogger(__name__)
+
+REGIMES_DB = str(Path(__file__).parent.parent / "regimes.db")
 
 # Basic bounds mapped to the 5 standard Risk Profiles (1: Conservative to 5: Aggressive)
 RISK_PROFILES = {
@@ -84,6 +89,25 @@ def run_greenfield_models_task(api_client: WebserverClient):
         
         api_client.post_greenfield_models(payload)
         logger.info(f"✅ Success! 5 Greenfield Model Portfolios pushed to Webserver.")
+
+        # Save snapshot for realignment tracking
+        try:
+            from tasks.realignment_task import (
+                init_snapshot_tables, save_conviction_snapshot, save_portfolio_positions
+            )
+            today_str = execution_date or datetime.date.today().isoformat()
+            snap_conn = sqlite3.connect(REGIMES_DB)
+            init_snapshot_tables(snap_conn)
+            for model in greenfield_models:
+                pid       = model["profile_id"]
+                pname     = model["profile_name"]
+                positions = model["positions"]
+                save_portfolio_positions(snap_conn, pid, pname, positions, today_str)
+                save_conviction_snapshot(snap_conn, pid, positions, today_str)
+            snap_conn.close()
+            logger.info("✅ Conviction snapshot saved for realignment tracking.")
+        except Exception as snap_exc:
+            logger.warning(f"Snapshot save failed (non-critical): {snap_exc}")
         
     except Exception as e:
         logger.error(f"❌ Greenfield Models Task Failed: {e}", exc_info=True)

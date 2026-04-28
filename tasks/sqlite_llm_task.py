@@ -17,12 +17,67 @@ import os
 
 load_dotenv(Path(project_root) / ".env")
 
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_HOST  = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:1.5b")
 
 # Maximum number of candidates passed to the LLM.
-# The rest are ranked out by the SQL pre-filter and never touch Ollama.
 TOP_N_CANDIDATES = int(os.getenv("LLM_TOP_N_CANDIDATES", "25"))
+
+# Agentic mode: set both to enable ReAct tool-calling loop.
+# Falls back to single-shot if MCP server is unreachable.
+LLM_AGENTIC_MODE = os.getenv("LLM_AGENTIC_MODE", "false").lower() == "true"
+MCP_SERVER_URL   = os.getenv("MCP_SERVER_URL", "")
+AGENT_MAX_ITERS  = int(os.getenv("AGENT_MAX_ITERS", "5"))
+
+# Ollama tool schemas for the 3 MCP tools
+_AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_quantitative_risk_tool",
+            "description": (
+                "Retrieve the latest HMM market regime and Monte Carlo risk metrics "
+                "(VaR-95, ES-95, mean return, probability of loss) for a stock ticker."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticker": {"type": "string", "description": "Stock ticker symbol"}
+                },
+                "required": ["ticker"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_filings_tool",
+            "description": (
+                "Semantic search over SEC 10-K/10-Q filings for a company. "
+                "Use this to find qualitative evidence about revenue guidance, risks, or strategy."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticker": {"type": "string", "description": "Stock ticker symbol"},
+                    "query":  {"type": "string", "description": "What to search for in the filings"},
+                },
+                "required": ["ticker", "query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_macro_indicators_tool",
+            "description": (
+                "Get current macroeconomic indicators: GDP growth, unemployment, "
+                "CPI inflation, and Federal Funds Rate."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +171,93 @@ def query_ollama(prompt: str) -> dict:
         logger.error(f"Failed to parse Ollama JSON: {e} - Raw: {result_text}")
         return {}
 
+def _run_agentic_scoring(ticker: str, horizon_days: int) -> tuple[float, str]:
+    """
+    ReAct-style agentic loop: Ollama autonomously calls MCP tools before
+    producing a final conviction score.
+
+    Returns (conviction_score, reasoning).
+    Falls back to (0.0, error_message) on failure.
+    """
+    from mcp_server.client import call_tool
+
+    system_prompt = (
+        f"You are a senior quantitative analyst at a hedge fund. "
+        f"Your job is to produce a single conviction score for a stock ticker "
+        f"on a scale from -1.0 (Strong Sell) to 1.0 (Strong Buy). "
+        f"You MUST use your tools to gather evidence before scoring: "
+        f"first check the quantitative risk metrics, then search for relevant "
+        f"qualitative information in SEC filings, then check macro context if relevant. "
+        f"Only after gathering evidence, output your final JSON verdict."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": (
+                f"Analyze {ticker} and provide an investment conviction score "
+                f"for a {horizon_days}-day horizon. Use your tools, then respond with:\n"
+                f'{{"conviction_score": <float -1.0 to 1.0>, "reasoning": "<one sentence>"}}'   
+            ),
+        },
+    ]
+
+    for iteration in range(AGENT_MAX_ITERS):
+        try:
+            resp = requests.post(
+                f"{OLLAMA_HOST}/api/chat",
+                json={"model": OLLAMA_MODEL, "messages": messages,
+                      "tools": _AGENT_TOOLS, "stream": False},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            msg = resp.json().get("message", {})
+        except Exception as exc:
+            logger.error(f"[{ticker}] Ollama chat error: {exc}")
+            return 0.0, f"Ollama error: {exc}"
+
+        # ── Tool calls requested ──
+        tool_calls = msg.get("tool_calls", [])
+        if tool_calls:
+            messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+            for tc in tool_calls:
+                fn   = tc.get("function", {})
+                name = fn.get("name", "")
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+
+                logger.info(f"  [{ticker}] Tool call: {name}({args})")
+                result = call_tool(name, args)
+                logger.info(f"  [{ticker}] Tool result: {result[:120]}...")
+
+                messages.append({"role": "tool", "content": result, "name": name})
+            continue  # next iteration with tool results in context
+
+        # ── Final response ──
+        content = msg.get("content", "")
+        if content:
+            try:
+                # Strip any markdown fences the model might add
+                clean = content.strip().strip("```json").strip("```").strip()
+                data  = json.loads(clean)
+                score = data.get("conviction_score", 0.0)
+                reason = data.get("reasoning", "No reasoning provided.")
+                if isinstance(score, (int, float)):
+                    return max(-1.0, min(1.0, float(score))), reason
+            except (json.JSONDecodeError, AttributeError):
+                pass  # model may still be reasoning; continue loop
+
+        if iteration == AGENT_MAX_ITERS - 1:
+            logger.warning(f"[{ticker}] Agent reached max iterations without a score.")
+
+    return 0.0, "Agent did not produce a conviction score within iteration limit."
+
+
 def _get_top_candidates(cursor, today_str: str, horizon_days: int, top_n: int) -> set[str]:
     """
     SQL pre-filter: rank all tickers by Calmar ratio and return the top N.
@@ -169,6 +311,16 @@ def run_sqlite_llm_task(db_path="regimes.db", horizon_days=20):
     Feed them to the local Ollama LLM to generate a Conviction Score (-1.0 to 1.0).
     Save the results back to the database.
     """
+    # Decide whether to use agentic mode (requires MCP server reachable)
+    use_agentic = False
+    if LLM_AGENTIC_MODE and MCP_SERVER_URL:
+        from mcp_server.client import is_server_available
+        use_agentic = is_server_available()
+        if use_agentic:
+            logger.info(f"Agentic mode ENABLED — MCP server reachable at {MCP_SERVER_URL}")
+        else:
+            logger.warning(f"Agentic mode requested but MCP server unreachable ({MCP_SERVER_URL}). Falling back to single-shot.")
+
     logger.info(f"=== Starting Daily SQLite LLM Conviction Task ({OLLAMA_MODEL}) ===")
     
     today_str = datetime.date.today().isoformat()
@@ -250,8 +402,11 @@ def run_sqlite_llm_task(db_path="regimes.db", horizon_days=20):
         fused_mean_ret = _avg_available(mean_ret_14d, mean_ret_60d)
         fused_prob_loss = _avg_available(prob_loss_14d, prob_loss_60d)
         
-        # 2. Formulate the strictly constrained Prompt
-        prompt = f"""You are a quantitative financial analyst evaluating the asset {ticker}.
+        # 2. Score the ticker ─ agentic (MCP tools) or single-shot
+        if use_agentic:
+            score, reasoning = _run_agentic_scoring(ticker, horizon_days)
+        else:
+            prompt = f"""You are a quantitative financial analyst evaluating the asset {ticker}.
 Based on two horizon-aware model views for today, produce one consolidated investment conviction.
 
 Short-Term View (14-day regime):
@@ -275,20 +430,13 @@ Respond ONLY with a valid JSON object in this exact format, with no markdown for
   "reasoning": "<short 1 sentence explanation>"
 }}
 """
-        
-        # 3. Query local Ollama
-        llm_response = query_ollama(prompt)
-        
-        score = llm_response.get("conviction_score")
-        reasoning = llm_response.get("reasoning", "LLM failed to provide reasoning.")
-        
-        # Fallback if the LLM hallucinated a non-float
-        if not isinstance(score, (int, float)):
-            logger.warning(f"LLM returned invalid score type for {ticker}: {score}. Defaulting to 0.0")
-            score = 0.0
-            
-        # Clamp score between -1 and 1
-        score = max(-1.0, min(1.0, float(score)))
+            llm_response = query_ollama(prompt)
+            score    = llm_response.get("conviction_score", 0.0)
+            reasoning = llm_response.get("reasoning", "LLM failed to provide reasoning.")
+            if not isinstance(score, (int, float)):
+                logger.warning(f"LLM returned invalid score for {ticker}: {score}. Defaulting to 0.0")
+                score = 0.0
+            score = max(-1.0, min(1.0, float(score)))
 
         logger.info(f"✅ {ticker} -> Score: {score} | Reason: {reasoning}")
         

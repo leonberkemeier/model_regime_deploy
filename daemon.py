@@ -16,6 +16,7 @@ from tasks.markov_task import run_markov_task
 from tasks.monte_carlo_task import run_monte_carlo_task
 from tasks.llm_task import run_llm_task
 from tasks.greenfield_portfolio_task import run_greenfield_models_task
+from tasks.realignment_task import run_realignment_task
 
 # Configure root logger
 logging.basicConfig(
@@ -35,7 +36,8 @@ def execute_daily_pipeline():
     run_monte_carlo_task(api_client)
     run_llm_task(api_client, ollama_client)
     run_greenfield_models_task(api_client)
-    
+    run_realignment_task()
+
     logger.info("=== ML Pipeline Finished -> Going back to sleep. ===")
 
 def main():
