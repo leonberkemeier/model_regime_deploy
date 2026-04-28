@@ -20,6 +20,10 @@ load_dotenv(Path(project_root) / ".env")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:1.5b")
 
+# Maximum number of candidates passed to the LLM.
+# The rest are ranked out by the SQL pre-filter and never touch Ollama.
+TOP_N_CANDIDATES = int(os.getenv("LLM_TOP_N_CANDIDATES", "25"))
+
 logger = logging.getLogger(__name__)
 
 def init_llm_table(conn):
@@ -112,6 +116,53 @@ def query_ollama(prompt: str) -> dict:
         logger.error(f"Failed to parse Ollama JSON: {e} - Raw: {result_text}")
         return {}
 
+def _get_top_candidates(cursor, today_str: str, horizon_days: int, top_n: int) -> set[str]:
+    """
+    SQL pre-filter: rank all tickers by Calmar ratio and return the top N.
+
+    Calmar ratio = avg_mean_expected_return / ABS(avg_var_95)
+    Higher = better risk-adjusted return relative to downside.
+
+    Hard gates applied before ranking:
+      - mean_expected_return > 0   (positive expected return)
+      - prob_loss < 0.55           (not more likely to lose than win)
+
+    Averaging across 14d and 60d lookbacks gives a more stable signal
+    than using either window alone.
+    """
+    cursor.execute('''
+        SELECT ticker
+        FROM (
+            SELECT
+                r.ticker,
+                AVG(m.mean_expected_return)                         AS avg_return,
+                AVG(m.var_95)                                       AS avg_var_95,
+                AVG(m.prob_loss)                                    AS avg_prob_loss,
+                CASE
+                    WHEN AVG(ABS(m.var_95)) > 0
+                    THEN AVG(m.mean_expected_return) / AVG(ABS(m.var_95))
+                    ELSE -999
+                END                                                 AS calmar_ratio
+            FROM daily_regimes r
+            INNER JOIN daily_monte_carlo m
+                ON  r.ticker        = m.ticker
+                AND r.date          = m.date
+                AND r.lookback_days = m.lookback_days
+                AND m.horizon_days  = ?
+            WHERE r.date = ?
+              AND m.mean_expected_return IS NOT NULL
+              AND m.var_95               IS NOT NULL
+            GROUP BY r.ticker
+            HAVING AVG(m.mean_expected_return) > 0
+               AND AVG(m.prob_loss)            < 0.55
+            ORDER BY calmar_ratio DESC
+            LIMIT ?
+        ) ranked
+    ''', (horizon_days, today_str, top_n))
+
+    return {row[0] for row in cursor.fetchall()}
+
+
 def run_sqlite_llm_task(db_path="regimes.db", horizon_days=20):
     """
     Fetch the HMM and Monte Carlo metrics for today from regimes.db.
@@ -155,7 +206,24 @@ def run_sqlite_llm_task(db_path="regimes.db", horizon_days=20):
         logger.warning(f"No joined HMM/MC data found for {today_str}. Did you run Phase 1 & 2?")
         return
 
-    logger.info(f"Found {len(assets)} assets to analyze with {OLLAMA_MODEL}...")
+    logger.info(f"Universe: {len(assets)} assets with HMM+MC data for {today_str}.")
+
+    # ── Pre-filter: rank by Calmar ratio, keep only top N ──────────────────
+    top_candidates = _get_top_candidates(cursor, today_str, horizon_days, TOP_N_CANDIDATES)
+
+    if not top_candidates:
+        logger.warning(
+            "Pre-filter returned 0 candidates. "
+            "Possible causes: no positive-return assets today, or Phase 2 hasn't run yet."
+        )
+        return
+
+    assets = [a for a in assets if a[0] in top_candidates]
+    logger.info(
+        f"Pre-filter (Calmar ratio, top {TOP_N_CANDIDATES}): "
+        f"{len(assets)} candidates selected for LLM analysis."
+    )
+    # ───────────────────────────────────────────────────────────────────────
     
     for (
         ticker,
