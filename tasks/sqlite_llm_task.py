@@ -29,6 +29,10 @@ LLM_AGENTIC_MODE = os.getenv("LLM_AGENTIC_MODE", "false").lower() == "true"
 MCP_SERVER_URL   = os.getenv("MCP_SERVER_URL", "")
 AGENT_MAX_ITERS  = int(os.getenv("AGENT_MAX_ITERS", "5"))
 
+# Task 4: Only save a conviction score if the LLM's confidence meets this bar.
+# Scores below threshold are logged as BLOCKED (executed=0) and treated as 0.0.
+AGENT_CONFIDENCE_THRESHOLD = float(os.getenv("AGENT_CONFIDENCE_THRESHOLD", "0.80"))
+
 # Ollama tool schemas for the 3 MCP tools
 _AGENT_TOOLS = [
     {
@@ -181,24 +185,42 @@ def _run_agentic_scoring(ticker: str, horizon_days: int) -> tuple[float, str]:
     """
     from mcp_server.client import call_tool
 
-    system_prompt = (
-        f"You are a senior quantitative analyst at a hedge fund. "
-        f"Your job is to produce a single conviction score for a stock ticker "
-        f"on a scale from -1.0 (Strong Sell) to 1.0 (Strong Buy). "
-        f"You MUST use your tools to gather evidence before scoring: "
-        f"first check the quantitative risk metrics, then search for relevant "
-        f"qualitative information in SEC filings, then check macro context if relevant. "
-        f"Only after gathering evidence, output your final JSON verdict."
-    )
+    system_prompt = """You are a senior quantitative analyst at a hedge fund.
+Your job is to score a stock ticker from -1.0 (Strong Sell) to 1.0 (Strong Buy).
+You MUST use your tools to gather evidence before scoring. Follow these four rules:
+
+RULE 1 — RISK VIOLATION (Mandatory override):
+If get_quantitative_risk shows es_95 is worse than -15%, the score MUST be
+below -0.5 regardless of other signals. Tail risk overrules all else.
+
+RULE 2 — NARRATIVE DECAY:
+If SEC filings or sentiment data show a clearly deteriorating narrative
+(rising risks, guidance cuts, negative management tone), reduce the score
+accordingly. A broken narrative is a sell signal even if math is stable.
+
+RULE 3 — OPPORTUNITY COST:
+Only rate a ticker highly if its mean_expected_return is materially better
+than alternatives (at least +1.5% higher). Marginal improvements do not
+justify high conviction.
+
+RULE 4 — PROTECT MOMENTUM:
+Do NOT assign a low score to a ticker purely to take profits if its es_95
+remains acceptable and filing sentiment is still positive. Let winners run.
+
+After gathering evidence, output your final verdict."""
 
     messages = [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": (
-                f"Analyze {ticker} and provide an investment conviction score "
-                f"for a {horizon_days}-day horizon. Use your tools, then respond with:\n"
-                f'{{"conviction_score": <float -1.0 to 1.0>, "reasoning": "<one sentence>"}}'   
+                f"Analyze {ticker} for a {horizon_days}-day investment horizon. "
+                f"Use your tools, apply the 4 rules, then respond ONLY with:\n"
+                f'{{\n'
+                f'  "conviction_score": <float -1.0 to 1.0>,\n'
+                f'  "reasoning": "<one sentence explaining the key driver>",\n'
+                f'  "confidence_score": <float 0.0 to 1.0 — how certain you are>\n'
+                f'}}'
             ),
         },
     ]
@@ -242,20 +264,24 @@ def _run_agentic_scoring(ticker: str, horizon_days: int) -> tuple[float, str]:
         content = msg.get("content", "")
         if content:
             try:
-                # Strip any markdown fences the model might add
                 clean = content.strip().strip("```json").strip("```").strip()
                 data  = json.loads(clean)
-                score = data.get("conviction_score", 0.0)
-                reason = data.get("reasoning", "No reasoning provided.")
+                score      = data.get("conviction_score", 0.0)
+                reason     = data.get("reasoning", "No reasoning provided.")
+                confidence = data.get("confidence_score", None)
                 if isinstance(score, (int, float)):
-                    return max(-1.0, min(1.0, float(score))), reason
+                    return (
+                        max(-1.0, min(1.0, float(score))),
+                        reason,
+                        float(confidence) if confidence is not None else None,
+                    )
             except (json.JSONDecodeError, AttributeError):
-                pass  # model may still be reasoning; continue loop
+                pass
 
         if iteration == AGENT_MAX_ITERS - 1:
             logger.warning(f"[{ticker}] Agent reached max iterations without a score.")
 
-    return 0.0, "Agent did not produce a conviction score within iteration limit."
+    return 0.0, "Agent did not produce a conviction score within iteration limit.", None
 
 
 def _get_top_candidates(cursor, today_str: str, horizon_days: int, top_n: int) -> set[str]:
@@ -424,8 +450,39 @@ def run_sqlite_llm_task(db_path="regimes.db", horizon_days=20):
         fused_prob_loss = _avg_available(prob_loss_14d, prob_loss_60d)
         
         # 2. Score the ticker ─ agentic (MCP tools) or single-shot
+        confidence = None
         if use_agentic:
-            score, reasoning = _run_agentic_scoring(ticker, horizon_days)
+            score, reasoning, confidence = _run_agentic_scoring(ticker, horizon_days)
+
+            # Task 4: Confidence gate — block low-certainty scores
+            if confidence is not None and confidence < AGENT_CONFIDENCE_THRESHOLD:
+                logger.warning(
+                    f"  [{ticker}] Confidence {confidence:.2f} below threshold "
+                    f"{AGENT_CONFIDENCE_THRESHOLD}. Logging as BLOCKED."
+                )
+                try:
+                    from tasks.trade_log import init_trade_log_table, log_trade
+                    tlog_conn = sqlite3.connect(db_path)
+                    init_trade_log_table(tlog_conn)
+                    log_trade(
+                        tlog_conn,
+                        action="BLOCKED",
+                        ticker=ticker,
+                        trigger_type="CONFIDENCE_GATE",
+                        rationale=(
+                            f"{ticker} scoring blocked: LLM confidence {confidence:.2f} "
+                            f"below threshold {AGENT_CONFIDENCE_THRESHOLD}. "
+                            f"Score ({score:.2f}) not saved. Reason: {reasoning}"
+                        ),
+                        log_date=today_str,
+                        conviction_score=score,
+                        confidence_score=confidence,
+                        executed=0,
+                    )
+                    tlog_conn.close()
+                except Exception as tlog_exc:
+                    logger.warning(f"Trade log write failed: {tlog_exc}")
+                continue  # skip saving this score
         else:
             prompt = f"""You are a quantitative financial analyst evaluating the asset {ticker}.
 Based on two horizon-aware model views for today, produce one consolidated investment conviction.
