@@ -188,6 +188,145 @@ def search_filings(ticker: str, query: str, n_results: int = 3) -> list[dict]:
 
 # ── Tool 3: Macro Indicators ──────────────────────────────────────────────────
 
+def get_realignment_candidates(profile_id: int) -> dict:
+    """
+    Portfolio Health Audit: compare a profile's weakest held positions
+    against the top market challengers not currently in the portfolio.
+
+    Weakest Links   — held tickers ranked by a weakness score:
+                      low win_probability + high expected_shortfall + low sentiment
+    Market Challengers — top 5 non-held tickers by today's LLM conviction score
+
+    Returns:
+        {
+          "profile_id": int,
+          "profile_name": str,
+          "evaluation_date": str,
+          "weakest_links": [ { ticker, conviction, prob_positive, es_95, sentiment, weakness_score } ],
+          "challengers":   [ { ticker, conviction, prob_positive, es_95, expected_return } ]
+        }
+    """
+    import datetime
+    today = datetime.date.today().isoformat()
+
+    if not Path(REGIMES_DB).exists():
+        return {"error": f"regimes.db not found at {REGIMES_DB}"}
+
+    try:
+        conn   = sqlite3.connect(REGIMES_DB)
+        cursor = conn.cursor()
+
+        # 1. Held tickers for this profile (most recent build)
+        cursor.execute("""
+            SELECT ticker, profile_name FROM model_portfolio_positions
+            WHERE profile_id = ?
+              AND build_date = (SELECT MAX(build_date) FROM model_portfolio_positions
+                                WHERE profile_id = ?)
+              AND ticker != 'CASH'
+        """, (profile_id, profile_id))
+        rows = cursor.fetchall()
+        if not rows:
+            conn.close()
+            return {"error": f"No portfolio found for profile_id={profile_id}"}
+
+        held_tickers = [r[0] for r in rows]
+        profile_name = rows[0][1]
+        held_set     = set(held_tickers)
+        ticker_list  = ",".join(f"'{t}'" for t in held_tickers)
+
+        # 2. Today's LLM conviction for held tickers
+        cursor.execute(f"""
+            SELECT ticker, conviction_score, var_95, mean_expected_return
+            FROM daily_llm_conviction
+            WHERE date = ? AND ticker IN ({ticker_list})
+        """, (today,))
+        llm_data = {r[0]: {"conviction": r[1], "var_95": r[2], "mean_return": r[3]}
+                    for r in cursor.fetchall()}
+
+        # 3. Today's MC risk for held tickers
+        cursor.execute(f"""
+            SELECT ticker, AVG(prob_positive), AVG(es_95)
+            FROM daily_monte_carlo
+            WHERE date = ? AND horizon_days = 20 AND ticker IN ({ticker_list})
+            GROUP BY ticker
+        """, (today,))
+        mc_data = {r[0]: {"prob_positive": r[1], "es_95": r[2]} for r in cursor.fetchall()}
+
+        # 4. Latest sentiment for held tickers (from financial_data.db if available)
+        sentiment_data: dict = {}
+        if Path(FINANCIAL_DB_PATH).exists():
+            try:
+                fconn  = sqlite3.connect(FINANCIAL_DB_PATH)
+                fcursor = fconn.cursor()
+                fcursor.execute(f"""
+                    SELECT c.ticker, AVG(s.sentiment_score)
+                    FROM fact_sentiment s
+                    JOIN dim_company c ON s.company_id = c.company_id
+                    WHERE c.ticker IN ({ticker_list})
+                    GROUP BY c.ticker
+                """)
+                sentiment_data = {r[0]: r[1] for r in fcursor.fetchall()}
+                fconn.close()
+            except Exception:
+                pass
+
+        # 5. Build Weakest Links — composite weakness score (higher = weaker)
+        weakest_links = []
+        for t in held_tickers:
+            conviction   = (llm_data.get(t, {}).get("conviction") or 0.0)
+            prob_pos     = (mc_data.get(t, {}).get("prob_positive") or 0.5)
+            es           = (mc_data.get(t, {}).get("es_95") or 0.0)
+            sentiment    = (sentiment_data.get(t) or 0.0)
+            # weakness: low conviction + low win probability + bad ES + negative sentiment
+            weakness = (-conviction) + (1 - prob_pos) + abs(min(es, 0)) + (-sentiment)
+            weakest_links.append({
+                "ticker":         t,
+                "conviction":     round(conviction, 3),
+                "prob_positive":  round(prob_pos, 3),
+                "es_95":          round(es, 4) if es else None,
+                "sentiment":      round(sentiment, 3) if sentiment else None,
+                "weakness_score": round(weakness, 3),
+            })
+        weakest_links.sort(key=lambda x: x["weakness_score"], reverse=True)
+
+        # 6. Market Challengers — top 5 non-held by conviction
+        cursor.execute("""
+            SELECT lc.ticker, lc.conviction_score, lc.mean_expected_return,
+                   AVG(mc.prob_positive), AVG(mc.es_95)
+            FROM daily_llm_conviction lc
+            LEFT JOIN daily_monte_carlo mc
+                ON lc.ticker = mc.ticker AND lc.date = mc.date AND mc.horizon_days = 20
+            WHERE lc.date = ?
+            GROUP BY lc.ticker
+            ORDER BY lc.conviction_score DESC
+        """, (today,))
+        challengers = []
+        for row in cursor.fetchall():
+            if row[0] not in held_set:
+                challengers.append({
+                    "ticker":          row[0],
+                    "conviction":      round(row[1], 3) if row[1] else None,
+                    "expected_return": round(row[2], 4) if row[2] else None,
+                    "prob_positive":   round(row[3], 3) if row[3] else None,
+                    "es_95":           round(row[4], 4) if row[4] else None,
+                })
+            if len(challengers) >= 5:
+                break
+
+        conn.close()
+        return {
+            "profile_id":       profile_id,
+            "profile_name":     profile_name,
+            "evaluation_date":  today,
+            "weakest_links":    weakest_links,
+            "challengers":      challengers,
+        }
+
+    except Exception as exc:
+        logger.error(f"get_realignment_candidates({profile_id}): {exc}")
+        return {"error": str(exc)}
+
+
 def get_trade_history(profile_id: int = None, days: int = 30) -> list[dict]:
     """
     Return the trade log for the last `days` days.

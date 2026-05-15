@@ -29,7 +29,8 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 from mcp.server.fastmcp import FastMCP
 from mcp_server.tools import (
-    get_quantitative_risk, search_filings, get_macro_indicators, get_trade_history
+    get_quantitative_risk, search_filings, get_macro_indicators,
+    get_trade_history, get_realignment_candidates,
 )
 
 logging.basicConfig(
@@ -106,6 +107,23 @@ def get_macro_indicators_tool() -> str:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_realignment_candidates_tool(profile_id: int) -> str:
+    """
+    Portfolio Health Audit for a given risk profile.
+    Returns two lists:
+      - weakest_links: the held positions most at risk (ranked by weakness score
+        combining low conviction, low win probability, high tail risk, low sentiment)
+      - challengers: top 5 non-held assets by today's conviction score
+
+    Use this before making swap or rebalancing decisions.
+
+    Args:
+        profile_id: Risk profile number (1=Conservative to 5=Aggressive)
+    """
+    return json.dumps(get_realignment_candidates(profile_id), default=str)
+
 
 @mcp.tool()
 def get_trade_history_tool(profile_id: int = None, days: int = 30) -> str:
