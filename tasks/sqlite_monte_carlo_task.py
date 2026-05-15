@@ -1,4 +1,5 @@
 import logging
+import os
 import sqlite3
 import datetime
 import sys
@@ -10,7 +11,69 @@ project_root = str(Path(__file__).parent.parent)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+from dotenv import load_dotenv
+load_dotenv(Path(project_root) / ".env")
+
 logger = logging.getLogger(__name__)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+# Set MC_USE_GARCH=false in .env to revert to plain Gaussian (for debugging)
+MC_USE_GARCH = os.getenv("MC_USE_GARCH", "true").lower() == "true"
+
+# Standard equity GARCH(1,1) parameters (Engle 2002)
+# alpha + beta < 1.0 guarantees variance stationarity
+_GARCH_ALPHA = float(os.getenv("GARCH_ALPHA", "0.09"))  # ARCH term: shock sensitivity
+_GARCH_BETA  = float(os.getenv("GARCH_BETA",  "0.90"))  # GARCH term: variance persistence
+
+
+# ── GARCH(1,1) simulation ─────────────────────────────────────────────────────
+
+def _simulate_garch_paths(
+    mean: float,
+    vol: float,
+    horizon_days: int,
+    n_simulations: int,
+) -> np.ndarray:
+    """
+    GARCH(1,1) Monte Carlo — simulates n_simulations forward paths of
+    `horizon_days` each with time-varying, mean-reverting volatility.
+
+    Model:
+        r_t     = mean + sqrt(h_t) * z_t         z_t ~ N(0,1)
+        h_{t+1} = omega + alpha*(r_t - mean)^2 + beta*h_t
+
+    omega is derived from the HMM state volatility so that the long-run
+    unconditional variance equals the HMM regime variance:
+        E[h] = omega / (1 - alpha - beta)  =>  omega = vol^2 * (1 - alpha - beta)
+
+    This produces volatility clustering: a large shock raises h_t, which
+    raises volatility for subsequent days before mean-reverting — exactly
+    what equity markets exhibit but plain Gaussian ignores.
+
+    Returns:
+        Array of shape (n_simulations,) — compounded horizon returns.
+    """
+    alpha = _GARCH_ALPHA
+    beta  = _GARCH_BETA
+    omega = (vol ** 2) * (1.0 - alpha - beta)   # anchors long-run variance to HMM
+    omega = max(omega, 1e-8)                      # numerical floor
+
+    # Draw all innovations at once — shape (n_simulations, horizon_days)
+    innovations = np.random.standard_normal((n_simulations, horizon_days))
+
+    daily_returns = np.empty((n_simulations, horizon_days))
+    h = np.full(n_simulations, vol ** 2, dtype=np.float64)  # initial conditional variance
+
+    for t in range(horizon_days):
+        z   = innovations[:, t]              # (n_simulations,)
+        r_t = mean + np.sqrt(h) * z          # daily returns this step
+        daily_returns[:, t] = r_t
+        # GARCH(1,1) variance update
+        h = omega + alpha * (r_t - mean) ** 2 + beta * h
+        h = np.maximum(h, 1e-8)              # keep variance positive
+
+    # Compound over the horizon: (1+r1)(1+r2)...(1+rT) - 1
+    return np.prod(1.0 + daily_returns, axis=1) - 1.0
 
 def init_mc_table(conn):
     """Initialize or migrate SQLite table for storing daily Monte Carlo results."""
@@ -33,9 +96,16 @@ def init_mc_table(conn):
             es_99 REAL,
             prob_loss REAL,
             prob_positive REAL,
+            simulation_method TEXT,
             UNIQUE(date, ticker, lookback_days, horizon_days)
         )
     ''')
+
+    # Add simulation_method column to existing DBs (safe migration)
+    cursor.execute("PRAGMA table_info(daily_monte_carlo)")
+    cols = {row[1] for row in cursor.fetchall()}
+    if "simulation_method" not in cols:
+        cursor.execute("ALTER TABLE daily_monte_carlo ADD COLUMN simulation_method TEXT")
 
     # Backward-compatible migration from old schema
     cursor.execute("PRAGMA table_info(daily_monte_carlo)")
@@ -120,21 +190,22 @@ def run_sqlite_monte_carlo_task(db_path="regimes.db", horizon_days=20, n_simulat
         logger.warning(f"No HMM regime data found for {today_str}. Did you run sqlite_regime_task first?")
         return
 
-    logger.info(f"Found {len(daily_regimes)} assets to simulate...")
-    
-    np.random.seed(42) # For reproducibility
-    
+    method = "GARCH(1,1)" if MC_USE_GARCH else "Gaussian"
+    logger.info(f"Found {len(daily_regimes)} assets to simulate... [method: {method}]")
+
+    np.random.seed(42)  # For reproducibility
+
     for ticker, lookback_days, mean, vol, state in daily_regimes:
         try:
-            # 2. Simulate Forward Paths directly from the HMM's exact state parameters
-            daily_returns = np.random.normal(
-                loc=mean,
-                scale=vol,
-                size=(n_simulations, horizon_days)
-            )
-            
-            # Compound returns over horizon
-            compounded = np.prod(1 + daily_returns, axis=1) - 1
+            # 2. Simulate forward paths
+            if MC_USE_GARCH:
+                compounded = _simulate_garch_paths(mean, vol, horizon_days, n_simulations)
+            else:
+                # Fallback: plain Gaussian (constant volatility)
+                daily_returns = np.random.normal(
+                    loc=mean, scale=vol, size=(n_simulations, horizon_days)
+                )
+                compounded = np.prod(1 + daily_returns, axis=1) - 1
             
             # 3. Calculate Risk Metrics
             mean_ret = float(np.mean(compounded))
@@ -151,16 +222,16 @@ def run_sqlite_monte_carlo_task(db_path="regimes.db", horizon_days=20, n_simulat
             
             # 4. Save to Database
             cursor.execute('''
-                INSERT OR REPLACE INTO daily_monte_carlo 
-                (date, ticker, lookback_days, horizon_days, simulations, mean_expected_return, median_expected_return, 
-                 var_95, var_99, es_95, es_99, prob_loss, prob_positive)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (today_str, ticker, int(lookback_days), horizon_days, n_simulations, 
-                  mean_ret, median_ret, var_95, var_99, es_95, es_99, prob_loss, prob_pos))
-            
+                INSERT OR REPLACE INTO daily_monte_carlo
+                (date, ticker, lookback_days, horizon_days, simulations, mean_expected_return, median_expected_return,
+                 var_95, var_99, es_95, es_99, prob_loss, prob_positive, simulation_method)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (today_str, ticker, int(lookback_days), horizon_days, n_simulations,
+                  mean_ret, median_ret, var_95, var_99, es_95, es_99, prob_loss, prob_pos, method))
+
             logger.info(
-                f"✅ {ticker} [{lookback_days}d regime | State: {state}] -> "
-                f"horizon: {horizon_days}d | VaR-95: {var_95:.2%} | Prob Loss: {prob_loss:.1%}"
+                f"✅ {ticker} [{lookback_days}d | {state}] "
+                f"VaR-95: {var_95:.2%} | ES-95: {es_95:.2%} | Prob Loss: {prob_loss:.1%}"
             )
             
         except Exception as e:
