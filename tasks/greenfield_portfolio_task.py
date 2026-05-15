@@ -95,19 +95,34 @@ def run_greenfield_models_task(api_client: WebserverClient):
             from tasks.realignment_task import (
                 init_snapshot_tables, save_conviction_snapshot, save_portfolio_positions
             )
+            from tasks.trade_log import init_trade_log_table, log_rebuild
             today_str = execution_date or datetime.date.today().isoformat()
             snap_conn = sqlite3.connect(REGIMES_DB)
             init_snapshot_tables(snap_conn)
+            init_trade_log_table(snap_conn)
             for model in greenfield_models:
                 pid       = model["profile_id"]
                 pname     = model["profile_name"]
                 positions = model["positions"]
                 save_portfolio_positions(snap_conn, pid, pname, positions, today_str)
                 save_conviction_snapshot(snap_conn, pid, positions, today_str)
+                # Log the greenfield construction as a REBUILD event
+                tickers = [p["ticker"] for p in positions if p["ticker"] != "CASH"]
+                log_rebuild(
+                    snap_conn,
+                    log_date=today_str,
+                    profile_id=pid,
+                    profile_name=pname,
+                    n_violations=len(tickers),
+                    violation_summary=(
+                        f"Greenfield construction: {len(tickers)} positions selected "
+                        f"({', '.join(tickers[:5])}{', ...' if len(tickers) > 5 else ''})"
+                    ),
+                )
             snap_conn.close()
-            logger.info("✅ Conviction snapshot saved for realignment tracking.")
+            logger.info("✅ Conviction snapshot and trade log saved.")
         except Exception as snap_exc:
-            logger.warning(f"Snapshot save failed (non-critical): {snap_exc}")
+            logger.warning(f"Snapshot/trade-log save failed (non-critical): {snap_exc}")
         
     except Exception as e:
         logger.error(f"❌ Greenfield Models Task Failed: {e}", exc_info=True)
