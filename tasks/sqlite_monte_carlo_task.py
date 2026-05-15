@@ -28,11 +28,72 @@ _GARCH_BETA  = float(os.getenv("GARCH_BETA",  "0.90"))  # GARCH term: variance p
 
 # ── GARCH(1,1) simulation ─────────────────────────────────────────────────────
 
+def _fit_garch_params(returns: np.ndarray) -> tuple[float, float, float]:
+    """
+    Fit GARCH(1,1) to a return series using the arch library.
+    Returns (omega, alpha, beta) in daily return scale.
+
+    Falls back to (None, _GARCH_ALPHA, _GARCH_BETA) when fitting fails
+    so the caller can use the HMM-derived omega with calibrated dynamics.
+    """
+    try:
+        from arch import arch_model
+        # Scale to % for numerical stability, then rescale params back
+        r_pct   = returns * 100.0
+        model   = arch_model(r_pct, vol="Garch", p=1, q=1, rescale=False)
+        result  = model.fit(disp="off", show_warning=False)
+        omega   = float(result.params["omega"]) / 10_000   # back to daily return scale
+        alpha   = float(result.params["alpha[1]"])
+        beta    = float(result.params["beta[1]"])
+        # Reject degenerate solutions
+        if alpha > 0 and beta > 0 and (alpha + beta) < 0.9995:
+            return omega, alpha, beta
+    except Exception:
+        pass
+    return None, _GARCH_ALPHA, _GARCH_BETA
+
+
+def _batch_fetch_returns(tickers: list[str], period: str = "1y") -> dict[str, np.ndarray]:
+    """
+    Batch-download 1 year of daily close prices via yfinance and compute
+    log-returns for each ticker. Returns {ticker: returns_array}.
+    Tickers with insufficient data are silently omitted.
+    """
+    if not tickers:
+        return {}
+    try:
+        import yfinance as yf
+        raw = yf.download(tickers, period=period, auto_adjust=True,
+                          progress=False, threads=True)
+        # yfinance returns MultiIndex columns for multiple tickers
+        if hasattr(raw.columns, "levels"):
+            close = raw["Close"]
+        else:
+            close = raw[["Close"]].rename(columns={"Close": tickers[0]})
+
+        result = {}
+        for ticker in tickers:
+            if ticker not in close.columns:
+                continue
+            prices = close[ticker].dropna()
+            if len(prices) < 60:
+                continue
+            returns = np.log(prices / prices.shift(1)).dropna().values
+            result[ticker] = returns
+        return result
+    except Exception as exc:
+        logger.warning(f"yfinance batch fetch failed: {exc}")
+        return {}
+
+
 def _simulate_garch_paths(
     mean: float,
     vol: float,
     horizon_days: int,
     n_simulations: int,
+    fitted_omega: float = None,
+    fitted_alpha: float = None,
+    fitted_beta:  float = None,
 ) -> np.ndarray:
     """
     GARCH(1,1) Monte Carlo — simulates n_simulations forward paths of
@@ -53,10 +114,14 @@ def _simulate_garch_paths(
     Returns:
         Array of shape (n_simulations,) — compounded horizon returns.
     """
-    alpha = _GARCH_ALPHA
-    beta  = _GARCH_BETA
-    omega = (vol ** 2) * (1.0 - alpha - beta)   # anchors long-run variance to HMM
-    omega = max(omega, 1e-8)                      # numerical floor
+    # Use fitted params if provided; fall back to literature defaults
+    alpha = fitted_alpha if fitted_alpha is not None else _GARCH_ALPHA
+    beta  = fitted_beta  if fitted_beta  is not None else _GARCH_BETA
+    if fitted_omega is not None:
+        omega = fitted_omega
+    else:
+        omega = (vol ** 2) * (1.0 - alpha - beta)  # anchor to HMM variance
+    omega = max(omega, 1e-8)                        # numerical floor
 
     # Draw all innovations at once — shape (n_simulations, horizon_days)
     innovations = np.random.standard_normal((n_simulations, horizon_days))
@@ -193,13 +258,36 @@ def run_sqlite_monte_carlo_task(db_path="regimes.db", horizon_days=20, n_simulat
     method = "GARCH(1,1)" if MC_USE_GARCH else "Gaussian"
     logger.info(f"Found {len(daily_regimes)} assets to simulate... [method: {method}]")
 
+    # Pre-fit GARCH parameters per ticker using 1 year of actual returns.
+    # This calibrates the volatility dynamics to each stock's own history
+    # rather than relying on generic equity defaults.
+    garch_params: dict[str, tuple] = {}  # ticker -> (omega, alpha, beta)
+    if MC_USE_GARCH:
+        all_tickers = list({r[0] for r in daily_regimes})
+        logger.info(f"Batch downloading 1y returns for GARCH fitting ({len(all_tickers)} tickers)...")
+        returns_map = _batch_fetch_returns(all_tickers)
+        fitted_count = 0
+        for tkr, ret in returns_map.items():
+            omega, alpha, beta = _fit_garch_params(ret)
+            garch_params[tkr] = (omega, alpha, beta)
+            if omega is not None:
+                fitted_count += 1
+        logger.info(
+            f"GARCH fitted for {fitted_count}/{len(all_tickers)} tickers; "
+            f"{len(all_tickers) - fitted_count} use literature defaults."
+        )
+
     np.random.seed(42)  # For reproducibility
 
     for ticker, lookback_days, mean, vol, state in daily_regimes:
         try:
             # 2. Simulate forward paths
             if MC_USE_GARCH:
-                compounded = _simulate_garch_paths(mean, vol, horizon_days, n_simulations)
+                fitted = garch_params.get(ticker, (None, None, None))
+                compounded = _simulate_garch_paths(
+                    mean, vol, horizon_days, n_simulations,
+                    fitted_omega=fitted[0], fitted_alpha=fitted[1], fitted_beta=fitted[2]
+                )
             else:
                 # Fallback: plain Gaussian (constant volatility)
                 daily_returns = np.random.normal(
