@@ -81,6 +81,28 @@ _AGENT_TOOLS = [
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_realignment_candidates_tool",
+            "description": (
+                "Portfolio health audit for a specific risk profile. "
+                "Returns the weakest held positions and top challenger assets not currently held. "
+                "Use this to understand if the ticker you are scoring is already in a portfolio "
+                "or if it is a potential replacement for an underperforming position."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "profile_id": {
+                        "type": "integer",
+                        "description": "Risk profile to audit (1=Conservative, 5=Aggressive). Use 3 if unsure.",
+                    }
+                },
+                "required": ["profile_id"],
+            },
+        },
+    },
 ]
 
 logger = logging.getLogger(__name__)
