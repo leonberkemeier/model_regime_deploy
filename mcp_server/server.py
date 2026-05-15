@@ -28,7 +28,9 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from mcp.server.fastmcp import FastMCP
-from mcp_server.tools import get_quantitative_risk, search_filings, get_macro_indicators
+from mcp_server.tools import (
+    get_quantitative_risk, search_filings, get_macro_indicators, get_trade_history
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,6 +106,25 @@ def get_macro_indicators_tool() -> str:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_trade_history_tool(profile_id: int = None, days: int = 30) -> str:
+    """
+    Return the portfolio trade log — every buy, sell, swap, and rebuild
+    decision made in the last `days` days, with a plain-English rationale
+    for each one.
+
+    Use this to understand WHY the portfolio changed, e.g.:
+      - Why was NVDA sold?
+      - What triggered the last portfolio rebuild?
+      - What was bought as a replacement for a position that was exited?
+
+    Args:
+        profile_id: Risk profile 1-5. If omitted, returns history for all profiles.
+        days:       How many days back to look (default: 30).
+    """
+    return json.dumps(get_trade_history(profile_id=profile_id, days=days), default=str)
+
 
 if __name__ == "__main__":
     logger.info(f"Starting QuantAdvisor MCP Server on {MCP_HOST}:{MCP_PORT}")

@@ -188,6 +188,18 @@ def search_filings(ticker: str, query: str, n_results: int = 3) -> list[dict]:
 
 # ── Tool 3: Macro Indicators ──────────────────────────────────────────────────
 
+def get_trade_history(profile_id: int = None, days: int = 30) -> list[dict]:
+    """
+    Return the trade log for the last `days` days.
+    If profile_id is None, returns entries for all profiles.
+
+    Each entry explains WHY a trade was made:
+      action, ticker, trigger_type, rationale, swap_ticker, executed
+    """
+    from tasks.trade_log import get_trade_history as _get
+    return _get(profile_id=profile_id, days=days, db_path=REGIMES_DB)
+
+
 def get_macro_indicators() -> dict:
     """
     Return the latest values for key FRED macroeconomic indicators:
