@@ -38,6 +38,9 @@ load_dotenv(Path(project_root) / ".env")
 
 from connectors.webserver_client import WebserverClient
 from config.settings import WEBSERVER_URL
+from tasks.trade_log import (
+    init_trade_log_table, log_trade, log_swap, log_rebuild
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +283,7 @@ def run_realignment_task(db_path: str = "regimes.db") -> bool:
 
     conn   = sqlite3.connect(db_path)
     init_snapshot_tables(conn)
+    init_trade_log_table(conn)
     cursor = conn.cursor()
 
     # Need a snapshot to compare against
@@ -306,7 +310,15 @@ def run_realignment_task(db_path: str = "regimes.db") -> bool:
     all_violations: list[dict] = []
     rebuild_needed = False
 
+    # Fetch profile names from snapshot for log labels
+    cursor.execute("""
+        SELECT DISTINCT profile_id, profile_name FROM model_portfolio_positions
+        WHERE build_date = ?
+    """, (snapshot_date,))
+    profile_names = {row[0]: row[1] for row in cursor.fetchall()}
+
     for profile_id, held_tickers in sorted(portfolios.items()):
+        profile_name = profile_names.get(profile_id, f"Profile {profile_id}")
         violations = check_violations(cursor, snapshot_date, today_str, profile_id, held_tickers)
 
         if violations:
@@ -315,16 +327,106 @@ def run_realignment_task(db_path: str = "regimes.db") -> bool:
                 logger.warning(f"  [{v['violation_type']}] {v['ticker']} — {v['detail']}")
             all_violations.extend(violations)
 
-            # Count non-opportunity violations (RISK + CONVICTION_DROP) vs held
+            # ── Write trade log entries for each violation ──
+            # Fetch today's metrics for log enrichment
+            ticker_list = ",".join(f"'{t}'" for t in held_tickers)
+            cursor.execute(f"""
+                SELECT ticker, conviction_score, var_95, mean_expected_return
+                FROM daily_llm_conviction WHERE date = ? AND ticker IN ({ticker_list})
+            """, (today_str,))
+            today_llm = {r[0]: {"conviction": r[1], "var_95": r[2], "mean_return": r[3]}
+                         for r in cursor.fetchall()}
+
+            cursor.execute(f"""
+                SELECT ticker, AVG(es_95) FROM daily_monte_carlo
+                WHERE date = ? AND horizon_days = 20 AND ticker IN ({ticker_list})
+                GROUP BY ticker
+            """, (today_str,))
+            today_es = {r[0]: r[1] for r in cursor.fetchall()}
+
+            opportunity_v = next((v for v in violations if v["violation_type"] == "OPPORTUNITY"), None)
+
+            for v in violations:
+                vtype  = v["violation_type"]
+                vticker = v["ticker"]
+                metrics = today_llm.get(vticker, {})
+
+                if vtype == "RISK":
+                    log_trade(
+                        conn,
+                        action="SELL",
+                        ticker=vticker,
+                        trigger_type="RISK_VIOLATION",
+                        rationale=(
+                            f"{vticker} flagged for exit: tail-risk has spiked beyond "
+                            f"profile envelope. {v['detail']}"
+                        ),
+                        log_date=today_str,
+                        profile_id=profile_id,
+                        profile_name=profile_name,
+                        conviction_score=metrics.get("conviction"),
+                        es_95=today_es.get(vticker),
+                        var_95=metrics.get("var_95"),
+                        mean_expected_return=metrics.get("mean_return"),
+                    )
+
+                elif vtype == "CONVICTION_DROP":
+                    log_trade(
+                        conn,
+                        action="SELL",
+                        ticker=vticker,
+                        trigger_type="CONVICTION_DROP",
+                        rationale=(
+                            f"{vticker} flagged for exit: LLM conviction has collapsed. "
+                            f"{v['detail']}"
+                        ),
+                        log_date=today_str,
+                        profile_id=profile_id,
+                        profile_name=profile_name,
+                        conviction_score=metrics.get("conviction"),
+                        es_95=today_es.get(vticker),
+                        var_95=metrics.get("var_95"),
+                        mean_expected_return=metrics.get("mean_return"),
+                    )
+
+                elif vtype == "OPPORTUNITY" and opportunity_v:
+                    # Find the weakest held ticker (lowest conviction) to swap out
+                    weakest = min(
+                        held_tickers,
+                        key=lambda t: today_llm.get(t, {}).get("conviction", 0.0)
+                    )
+                    weakest_metrics = today_llm.get(weakest, {})
+
+                    cursor.execute("""
+                        SELECT AVG(mean_expected_return) FROM daily_monte_carlo
+                        WHERE ticker = ? AND date = ? AND horizon_days = 20
+                    """, (vticker, today_str))
+                    challenger_row = cursor.fetchone()
+                    challenger_mean = challenger_row[0] if challenger_row else None
+
+                    log_swap(
+                        conn,
+                        log_date=today_str,
+                        profile_id=profile_id,
+                        profile_name=profile_name,
+                        sell_ticker=weakest,
+                        buy_ticker=vticker,
+                        sell_conviction=weakest_metrics.get("conviction", 0.0),
+                        buy_conviction=float(v.get("detail", "0").split("score=")[-1].split(" ")[0])
+                            if "score=" in v.get("detail", "") else 0.0,
+                        sell_es_95=today_es.get(weakest),
+                        sell_mean_return=weakest_metrics.get("mean_return"),
+                        buy_mean_return=challenger_mean,
+                    )
+
+            # Count hard violations for rebuild threshold
             hard_violations = [v for v in violations if v["violation_type"] != "OPPORTUNITY"]
             ratio = len(hard_violations) / len(held_tickers) if held_tickers else 0
 
-            if ratio >= REBUILD_TRIGGER_RATIO or any(
-                v["violation_type"] == "OPPORTUNITY" for v in violations
-            ):
+            if ratio >= REBUILD_TRIGGER_RATIO or opportunity_v:
                 logger.warning(
                     f"Profile {profile_id}: rebuild threshold reached "
-                    f"({ratio:.0%} hard violations, opportunity={any(v['violation_type']=='OPPORTUNITY' for v in violations)})"
+                    f"({ratio:.0%} hard violations, opportunity={opportunity_v is not None})"
                 )
                 rebuild_needed = True
         else:
@@ -335,6 +437,25 @@ def run_realignment_task(db_path: str = "regimes.db") -> bool:
     # Trigger rebuild if any profile exceeded thresholds
     if rebuild_needed:
         logger.warning("=== THESIS DECAY DETECTED — Triggering portfolio rebuild ===")
+
+        # Log a REBUILD entry for each affected profile
+        violation_types = list({v["violation_type"] for v in all_violations})
+        summary = ", ".join(violation_types)
+        for profile_id, held_tickers in sorted(portfolios.items()):
+            profile_name = profile_names.get(profile_id, f"Profile {profile_id}")
+            profile_violations = [v for v in all_violations
+                                   if any(t == v["ticker"] for t in held_tickers)
+                                   or v["violation_type"] == "OPPORTUNITY"]
+            if profile_violations:
+                log_rebuild(
+                    conn,
+                    log_date=today_str,
+                    profile_id=profile_id,
+                    profile_name=profile_name,
+                    n_violations=len(profile_violations),
+                    violation_summary=summary,
+                )
+
         try:
             from tasks.greenfield_portfolio_task import run_greenfield_models_task
             api_client = WebserverClient(WEBSERVER_URL)
