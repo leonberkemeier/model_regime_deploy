@@ -207,7 +207,8 @@ def get_realignment_candidates(profile_id: int) -> dict:
         }
     """
     import datetime
-    today = datetime.date.today().isoformat()
+    today      = datetime.date.today().isoformat()
+    today_date = datetime.date.today()
 
     if not Path(REGIMES_DB).exists():
         return {"error": f"regimes.db not found at {REGIMES_DB}"}
@@ -252,20 +253,36 @@ def get_realignment_candidates(profile_id: int) -> dict:
         """, (today,))
         mc_data = {r[0]: {"prob_positive": r[1], "es_95": r[2]} for r in cursor.fetchall()}
 
-        # 4. Latest sentiment for held tickers (from financial_data.db if available)
-        sentiment_data: dict = {}
+        # 4. Latest sentiment with decay: Score × (1 - 0.02 × days_since_reading)
+        # Ensures old headlines fade in relevance over a ~50-day window.
+        sentiment_data: dict = {}  # ticker -> decayed_sentiment_score
         if Path(FINANCIAL_DB_PATH).exists():
             try:
-                fconn  = sqlite3.connect(FINANCIAL_DB_PATH)
+                import datetime as _dt
+                fconn   = sqlite3.connect(FINANCIAL_DB_PATH)
                 fcursor = fconn.cursor()
+                # Fetch most recent sentiment reading per ticker with its date
                 fcursor.execute(f"""
-                    SELECT c.ticker, AVG(s.sentiment_score)
+                    SELECT c.ticker, s.sentiment_score, d.date
                     FROM fact_sentiment s
                     JOIN dim_company c ON s.company_id = c.company_id
+                    JOIN dim_date    d ON s.date_id    = d.date_id
                     WHERE c.ticker IN ({ticker_list})
-                    GROUP BY c.ticker
+                    ORDER BY d.date DESC
                 """)
-                sentiment_data = {r[0]: r[1] for r in fcursor.fetchall()}
+                seen = set()
+                for tkr, score, date_str in fcursor.fetchall():
+                    if tkr in seen:
+                        continue
+                    seen.add(tkr)
+                    try:
+                        reading_date = _dt.date.fromisoformat(str(date_str))
+                        days_old     = (today_date - reading_date).days
+                        # Decay formula: score × (1 - 0.02 × t), floor at 0
+                        decay_factor = max(0.0, 1.0 - 0.02 * days_old)
+                        sentiment_data[tkr] = (score or 0.0) * decay_factor
+                    except Exception:
+                        sentiment_data[tkr] = score or 0.0
                 fconn.close()
             except Exception:
                 pass
