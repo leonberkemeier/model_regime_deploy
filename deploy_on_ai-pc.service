@@ -1,0 +1,67 @@
+# Quant-Agent Advisor — AI PC Daemon
+# ====================================
+# Runs the daily ML pipeline (HMM → GARCH MC → LLM → Portfolio).
+# Restarts automatically on crash. Logs to systemd journal.
+#
+# INSTALL (run as the user who owns the project):
+#
+#   # 1. Edit the paths below to match your deployment location
+#   # 2. Copy to systemd user directory
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy_on_ai-pc.service ~/.config/systemd/user/
+#
+#   # 3. Enable and start
+#   systemctl --user daemon-reload
+#   systemctl --user enable deploy_on_ai-pc.service
+#   systemctl --user start  deploy_on_ai-pc.service
+#
+#   # 4. Check status / logs
+#   systemctl --user status deploy_on_ai-pc.service
+#   journalctl --user -u deploy_on_ai-pc.service -f
+#
+#   # 5. To survive logout (run even when not logged in):
+#   loginctl enable-linger $USER
+#
+# UNINSTALL:
+#   systemctl --user stop    deploy_on_ai-pc.service
+#   systemctl --user disable deploy_on_ai-pc.service
+#   rm ~/.config/systemd/user/deploy_on_ai-pc.service
+#   systemctl --user daemon-reload
+
+[Unit]
+Description=Quant-Agent Advisor — AI PC ML Pipeline Daemon
+Documentation=https://github.com/your-repo/deploy_on_ai-pc
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ── Paths — edit these to match your deployment ──────────────
+WorkingDirectory=/home/archy/Desktop/Server/FinancialData/deploy_on_ai-pc
+ExecStart=/home/archy/Desktop/Server/FinancialData/deploy_on_ai-pc/venv/bin/python daemon.py
+
+# ── Environment ───────────────────────────────────────────────
+EnvironmentFile=/home/archy/Desktop/Server/FinancialData/deploy_on_ai-pc/.env
+
+# ── Restart policy ────────────────────────────────────────────
+# Restart on any non-zero exit code (crashes, OOM, etc.)
+Restart=on-failure
+RestartSec=30s
+# Don't restart more than 5 times in 10 minutes (prevents crash loops)
+StartLimitInterval=600
+StartLimitBurst=5
+
+# ── Logging ───────────────────────────────────────────────────
+# All stdout/stderr goes to systemd journal.
+# Read with: journalctl --user -u deploy_on_ai-pc.service
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=quant-advisor
+
+# ── Resource limits ───────────────────────────────────────────
+# Allow the process enough time to finish before force-kill on stop.
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target
