@@ -370,10 +370,31 @@ def run_sqlite_llm_task(db_path="regimes.db", horizon_days=20):
         )
         return
 
+    # Always include currently held portfolio tickers so they get a fresh
+    # score today — even if they've drifted below the Calmar rank threshold.
+    # Without this, a degrading held position never triggers a violation.
+    try:
+        cursor.execute("""
+            SELECT DISTINCT ticker FROM model_portfolio_positions
+            WHERE build_date = (SELECT MAX(build_date) FROM model_portfolio_positions)
+              AND ticker != 'CASH'
+        """)
+        held_in_portfolio = {row[0] for row in cursor.fetchall()}
+    except Exception:
+        held_in_portfolio = set()  # table may not exist on first run
+
+    forced_extra = held_in_portfolio - top_candidates
+    if forced_extra:
+        logger.info(
+            f"{len(forced_extra)} held ticker(s) outside top {TOP_N_CANDIDATES} "
+            f"forced into scoring: {sorted(forced_extra)}"
+        )
+        top_candidates |= forced_extra
+
     assets = [a for a in assets if a[0] in top_candidates]
     logger.info(
-        f"Pre-filter (Calmar ratio, top {TOP_N_CANDIDATES}): "
-        f"{len(assets)} candidates selected for LLM analysis."
+        f"Pre-filter: {len(assets)} candidates "
+        f"(top {TOP_N_CANDIDATES} by Calmar + {len(forced_extra)} held tickers)."
     )
     # ───────────────────────────────────────────────────────────────────────
     
