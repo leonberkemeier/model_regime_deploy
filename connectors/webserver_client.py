@@ -80,3 +80,9 @@ class WebserverClient:
         response = requests.post(f"{self.base_url}/api/portfolio/greenfield_models", json=payload)
         response.raise_for_status()
         return response.json()
+
+    def post_realignment_plans(self, payload: dict):
+        """Pushes LLM-generated realignment trade plans to the Webserver"""
+        response = requests.post(f"{self.base_url}/api/portfolio/realignment_plans", json=payload)
+        response.raise_for_status()
+        return response.json()

@@ -175,7 +175,7 @@ def query_ollama(prompt: str) -> dict:
         logger.error(f"Failed to parse Ollama JSON: {e} - Raw: {result_text}")
         return {}
 
-def _run_agentic_scoring(ticker: str, horizon_days: int) -> tuple[float, str]:
+def _run_agentic_scoring(ticker: str, horizon_days: int) -> tuple[float, str, float | None]:
     """
     ReAct-style agentic loop: Ollama autonomously calls MCP tools before
     producing a final conviction score.
@@ -237,7 +237,7 @@ After gathering evidence, output your final verdict."""
             msg = resp.json().get("message", {})
         except Exception as exc:
             logger.error(f"[{ticker}] Ollama chat error: {exc}")
-            return 0.0, f"Ollama error: {exc}"
+            return 0.0, f"Ollama error: {exc}", None
 
         # ── Tool calls requested ──
         tool_calls = msg.get("tool_calls", [])
